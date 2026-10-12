@@ -5,6 +5,7 @@ from rpython.rtyper.rclass import OBJECTPTR
 from rpython.rtyper.lltypesystem import lltype
 from rpython.rtyper.lltypesystem import rffi
 from rpython.translator.tool.cbuild import ExternalCompilationInfo
+import glob
 import os
 from rpython.metatensor.core import (tracing, F64, HOSTARRAY, SHAPEARRAY, TENSOR, TENSORARRAY, _shape1, nbytes)
 
@@ -59,8 +60,12 @@ SIGNEDARRAY = rffi.CArray(lltype.Signed)
 _here = os.path.dirname(os.path.abspath(__file__))
 CUDA_HOME = os.environ.get('CUDA_HOME', '/usr/local/cuda')
 _cublas = os.environ.get('RTENSOR_CUBLAS')
+# Without cuda.h (e.g. CI) cuda.c builds against cuda_stub.h and needs no libcuda.
+_have_cuda = any(os.path.exists(os.path.join(d, 'cuda.h')) for d in
+                 [os.path.join(CUDA_HOME, 'include'), '/usr/include',
+                  '/usr/local/include'] + glob.glob('/usr/include/*-linux-gnu'))
 eci = ExternalCompilationInfo(
-    include_dirs=[os.path.join(CUDA_HOME, 'include')],
+    include_dirs=[os.path.join(CUDA_HOME, 'include'), _here],
     compile_extra=['-DRTENSOR_CUBLAS_PATH=%s' % _cublas] if _cublas else [],
     separate_module_files=[os.path.join(_here, 'cuda.c')],
     post_include_bits=["""
@@ -112,7 +117,7 @@ RPY_EXTERN int rt_cuda_bmm2(long a, long b, long c, long nb2, long sa2,
                             long dtype, long lda, long ldb, long ldc,
                             long sa, long sb, long sc, long tf32);
 """],
-    libraries=['cuda', 'dl'])
+    libraries=['cuda', 'dl'] if _have_cuda else ['dl'])
 rt_cuda_load = rffi.llexternal('rt_cuda_load', [rffi.CCHARP, rffi.CCHARP],
                                lltype.Signed, compilation_info=eci,
                                 releasegil=False)

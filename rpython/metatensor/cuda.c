@@ -1,4 +1,8 @@
+#if defined(__has_include) && !__has_include(<cuda.h>)
+#include "cuda_stub.h"
+#else
 #include <cuda.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
