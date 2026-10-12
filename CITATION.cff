@@ -12,9 +12,9 @@ abstract: >-
   tensor runtime, MetaTensor. Traced chains of tensor operations become fused
   GPU kernels. The code is in rpython/metatensor/, pypy/module/_metatensor/
   and lib_pypy/tensorpypy/, and benchmark/ holds the MetaTensor benchmarks.
-  Note: benchmark/motion/ (the MOTION leave transition, its rule audit and a
-  hand-written adapter) is a separate study that only shares this repository;
-  it is not part of TensorPyPy.
+  Note: TensorPyPy is one part of the larger MOTION study. benchmark/motion/
+  (the MOTION leave transition, its rule audit and a hand-written adapter)
+  belongs to that wider study and is not described by this record.
 keywords:
   - PyPy
   - RPython
