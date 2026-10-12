@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it using these metadata."
-title: "TensorPyPy: MetaTensor and the MOTION leave transition"
+title: "TensorPyPy: Tensor-Aware Meta-Tracing JIT Compiler"
 type: software
 authors:
   - family-names: Izawa
@@ -10,9 +10,11 @@ license: MIT
 abstract: >-
   TensorPyPy is a fork of PyPy whose RPython meta-tracing JIT carries a
   tensor runtime, MetaTensor. Traced chains of tensor operations become fused
-  GPU kernels. The repository also holds the MOTION leave transition, which
-  is generated from an interpreter change rule, together with an audit of
-  that rule and a hand-written adapter for comparison.
+  GPU kernels. The code is in rpython/metatensor/, pypy/module/_metatensor/
+  and lib_pypy/tensorpypy/, and benchmark/ holds the MetaTensor benchmarks.
+  Note: benchmark/motion/ (the MOTION leave transition, its rule audit and a
+  hand-written adapter) is a separate study that only shares this repository;
+  it is not part of TensorPyPy.
 keywords:
   - PyPy
   - RPython

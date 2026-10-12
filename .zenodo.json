@@ -1,5 +1,5 @@
 {
-  "title": "TensorPyPy: MetaTensor and the MOTION leave transition",
+  "title": "TensorPyPy: Tensor-Aware Meta-Tracing JIT Compiler",
   "upload_type": "software",
   "creators": [
     {
@@ -8,7 +8,7 @@
     }
   ],
   "license": "MIT",
-  "description": "TensorPyPy is a fork of PyPy whose RPython meta-tracing JIT carries a tensor runtime, MetaTensor. Traced chains of tensor operations become fused GPU kernels. The repository also holds the MOTION leave transition, which is generated from an interpreter change rule, together with an audit of that rule and a hand-written adapter for comparison.",
+  "description": "TensorPyPy is a fork of PyPy whose RPython meta-tracing JIT compiler provides a tensor runtime, MetaTensor. Traced chains of tensor operations in the Python program become fused GPU kernels. The code is in rpython/metatensor/, pypy/module/_metatensor/ and lib_pypy/tensorpypy/, and benchmark/ holds the MetaTensor benchmarks. Note: benchmark/motion/ (the MOTION leave transition, its rule audit and a hand-written adapter) is a separate study that only shares this repository; it is not part of TensorPyPy.",
   "keywords": [
     "PyPy",
     "RPython",
