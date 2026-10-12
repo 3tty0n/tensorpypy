@@ -7,14 +7,32 @@ authors:
     given-names: Yusuke
     affiliation: Tokyo Metropolitan University
 license: MIT
-abstract: >-
-  TensorPyPy is a fork of PyPy whose RPython meta-tracing JIT carries a
-  tensor runtime, MetaTensor. Traced chains of tensor operations become fused
-  GPU kernels. The code is in rpython/metatensor/, pypy/module/_metatensor/
-  and lib_pypy/tensorpypy/, and benchmark/ holds the MetaTensor benchmarks.
-  Note: TensorPyPy is one part of the larger MOTION study. benchmark/motion/
-  (the MOTION leave transition, its rule audit and a hand-written adapter)
-  belongs to that wider study and is not described by this record.
+abstract: |-
+  TensorPyPy is a fork of PyPy whose RPython meta-tracing JIT compiler
+  provides a tensor runtime, MetaTensor. Traced chains of tensor operations
+  in the Python program become fused GPU kernels. The code is in
+  rpython/metatensor/, pypy/module/_metatensor/ and lib_pypy/tensorpypy/,
+  and benchmark/ holds the MetaTensor benchmarks.
+
+  benchmark/motion/ contains a prototype of MOTION, a method that derives
+  the program transition for a change in the execution environment from
+  interpreter code instead of writing it by hand. The example change is
+  leave: a worker leaves a group computation before its contribution is
+  committed, and a declared reason decides whether that contribution is kept
+  or removed.
+
+  The prototype consists of:
+  - a 7-line change rule (pypy/module/_metatensor/rule_leave.py), compiled
+    by the meta-tracer like other interpreter code;
+  - a static check (benchmark/eval/audit_rules.py) that the rule uses only
+    the abstract interface in motion_iface.py, and a non-conforming rule
+    (benchmark/motion/rule_leave_leaky.py) that the check rejects;
+  - an independent checker (benchmark/motion/check_leave.py) that compares
+    the generated transition with an interpreter-only run;
+  - a hand-written adapter for comparison
+    (benchmark/motion/adapter_leave.py), and a script
+    (benchmark/motion/count_lines.py) that counts the hand-written lines of
+    each.
 keywords:
   - PyPy
   - RPython
