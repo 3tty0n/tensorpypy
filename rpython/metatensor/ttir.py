@@ -1,3 +1,4 @@
+import sys
 from rpython.rlib.rfloat import INFINITY, formatd
 from rpython.metatensor.core import (ADD, ARITY, CD_BK, CD_BM, CD_BN, CD_G, CD_GM, CD_O, CD_ROWS, CONV, conv_col_tiles, conv_descs, conv_grouped_dot, main_conv, B_KEEP_NZ, B_KEEP_Z, B_LT, B_MAX, B_MIN, B_NE, B_POW, BINARY, U_GELU, U_NEG, U_SIGMOID, U_SILU, U_TANH, UNARY, bc_mode, binary_fn, GA_ROWS, AXIS_ALL, BC_L_COL, BC_L_ROW, BC_L_SCALAR, BC_R_COL, BC_R_ROW, BC_R_SCALAR, COMP_NEG_INF, COMP_TYPE, DIV, EQMASK, EXP, GATHER, GA_COL2CHW, GA_HEADMERGE, GA_HEADSPLIT, GA_IM2COL, GA_IM2COL_NHWC, GA_IM2COL2, GA_IM2COL_T, GA_MAXPOOL_NHWC, GA_POOL, GA_ROTHALF, GA_SCATTER, GA_STRIDED, GA_TAKE, POOL_ADAPTIVE, POOL_AVG, POOL_DEPTHWISE, conv_out, MAXR, MUL, RELU, RELUGRAD, SQRT, STORE_TYPE, SUB, SUM, config, gather_changes_shape, gather_dh, gather_heads, gather_kind, has_conv, is_reduction, nvals, view_clamp, GA_VIEW, view_numel, view_of, view_offset, view_params, view_params_list)
 
@@ -2049,20 +2050,25 @@ def _header(e, name, ins, S):
           'attributes {noinline = false} {' % (name, ', '.join(args), S))
 
 
+# 1 << 31 is a long on a 32-bit host, which RPython rejects; a word there
+# cannot reach 2**31 anyway, so sys.maxint is the same test.
+I32_LIMIT = min(1 << 31, sys.maxint)
+
+
 def strided_fits_i32(params):
     nsrc = params[0]
     rank = params[1]
     n = 1
     for j in range(rank):
         n *= params[2 + j]
-    if n >= 1 << 31:
+    if n >= I32_LIMIT:
         return False
     for s in range(nsrc):
         base = 2 + rank + 3 * rank * s
         ext = 0
         for j in range(rank):
             ext += (params[2 + j] - 1) * abs(params[base + j])
-        if ext >= 1 << 31:
+        if ext >= I32_LIMIT:
             return False
     return True
 
