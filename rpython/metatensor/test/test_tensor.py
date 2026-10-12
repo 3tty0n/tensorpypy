@@ -1,0 +1,4353 @@
+import math
+from rpython.jit.metainterp.test.support import LLJitMixin
+from rpython.rlib import jit
+from rpython.rlib.jit import JitDriver, promote
+from rpython.metatensor import core, device, kernels, nn, ops, runtime, ttir
+from rpython.metatensor.core import from_list
+from rpython.metatensor.ops import (tensor_add, tensor_mul, tensor_relu,
+    tensor_sum, tensor_item, tensor_size)
+
+kernels.init_device()
+
+class TestTensor(LLJitMixin):
+
+    def test_fuse_chain_into_one_launch(self):
+        driver = JitDriver(greens=[], reds=['n', 'w', 'b', 'acc'])
+        def f(n):
+            w = from_list([1.0, -2.0, 3.0, -4.0])
+            b = from_list([0.5, 0.5, 0.5, 0.5])
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, acc=acc, w=w, b=b)
+                h = tensor_relu(tensor_add(tensor_mul(w, b, 0), b, 0))
+                acc += tensor_item(tensor_sum(h, -1))
+                n -= 1
+            return acc
+        import os
+        before = kernels.counter.n
+        res = self.meta_interp(f, [10])
+        assert res == f(10)
+        if 'RTENSOR_CPU' not in os.environ:
+            assert kernels.counter.n > before
+        self.check_simple_loop(call_r=1, call_pure_r=0, call_f=1)
+
+    def test_guard_inside_region_resumes(self):
+        driver = JitDriver(greens=[], reds=['n', 'w', 'b', 'acc'])
+        def f(n):
+            w = from_list([1.0, -2.0, 3.0, -4.0])
+            b = from_list([0.5, 0.5, 0.5, 0.5])
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, acc=acc, w=w, b=b)
+                t = tensor_mul(w, b, 0)
+                if n % 7 == 0:
+                    t = tensor_add(t, b, 0)
+                h = tensor_relu(t)
+                acc += tensor_item(tensor_sum(h, -1))
+                n -= 1
+            return acc
+        res = self.meta_interp(f, [30])
+        assert res == f(30)
+        from rpython.jit.metainterp.test.support import get_stats
+        assert get_stats().compiled_count >= 2
+        self.check_resops(call_pure_r=0)
+
+    def test_loop_carried_tensor(self):
+        driver = JitDriver(greens=[], reds=['n', 'h', 'b'])
+        def f(n):
+            h = from_list([1.0, 2.0, 3.0])
+            b = from_list([0.5, -0.5, 0.25])
+            while n > 0:
+                driver.jit_merge_point(n=n, h=h, b=b)
+                h = tensor_relu(tensor_add(h, b, 0))
+                n -= 1
+            return tensor_item(tensor_sum(h, -1))
+        res = self.meta_interp(f, [12])
+        assert res == f(12)
+        self.check_simple_loop(call_r=1)
+
+class TestScalarImmediates(LLJitMixin):
+
+    def test_many_scalar_leaves_fuse_into_one_kernel(self):
+        driver = JitDriver(greens=[], reds=['n', 'w', 'b', 'acc'])
+        def f(n):
+            w = from_list([1.0, -2.0, 3.0, -4.0])
+            b = from_list([0.5, 0.25, -0.5, 2.0])
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, acc=acc, w=w, b=b)
+                h = ops.mul(w, b)
+                h = ops.mul(h, runtime.scalar(0.1))
+                h = ops.add(h, runtime.scalar(0.2))
+                h = ops.mul(h, runtime.scalar(0.3))
+                h = ops.add(h, runtime.scalar(0.4))
+                h = ops.mul(h, runtime.scalar(0.5))
+                h = ops.add(h, runtime.scalar(0.6))
+                h = ops.mul(h, runtime.scalar(0.7))
+                acc += ops.item(ops.sum(h))
+                n -= 1
+            return acc
+        before = set(kernels.kernel_cache.kernels)
+        res = self.meta_interp(f, [10])
+        assert abs(res - f(10)) < 1e-9
+        # Seven scalars and two tensors: without immediates that is nine
+        # leaves against MAX_INPUTS=6, so the chain would be cut into several
+        # launches.
+        self.check_simple_loop(call_r=1, call_f=1)
+        added = set(kernels.kernel_cache.kernels) - before
+        assert len(added) == 1
+        key = added.pop()
+        assert key.split(',')[0] == '2'
+        assert len([p for p in key.split(',') if p.startswith('k')]) == 7
+
+    def test_gelu_erf_fuses_into_one_kernel(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'acc'])
+        def f(n):
+            x = from_list([-3.0, -1.0, 0.5, 2.5])
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, acc=acc, x=x)
+                acc += ops.item(ops.sum(tensor_add(
+                    nn.gelu_erf(nn.Tensor(x)).t, x, 0)))
+                n -= 1
+            return acc
+        res = self.meta_interp(f, [10])
+        assert abs(res - f(10)) < 1e-9
+        self.check_simple_loop(call_r=1, call_f=1)
+
+
+class TestTensorMeta(LLJitMixin):
+
+    def test_size_of_virtual_does_not_force(self):
+        driver = JitDriver(greens=[], reds=['n', 'w', 'b', 'acc'])
+        def f(n):
+            w = from_list([1.0, -2.0, 3.0, -4.0])
+            b = from_list([0.5, 0.5, 0.5, 0.5])
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, acc=acc, w=w, b=b)
+                h = tensor_relu(tensor_add(tensor_mul(w, b, 0), b, 0))
+                if tensor_size(h) > 2:
+                    h = tensor_add(h, b, 0)
+                if tensor_size(tensor_sum(h, -1)) == 1:
+                    acc += tensor_item(tensor_sum(h, -1))
+                n -= 1
+            return acc
+        res = self.meta_interp(f, [10])
+        assert res == f(10)
+        self.check_simple_loop(call_r=1, call_pure_r=0)
+
+    def test_kernel_cache_reuses_compiled_kernel(self):
+        driver = JitDriver(greens=[], reds=['n', 'w', 'b', 'acc'])
+        def f(n):
+            w = from_list([1.0, -2.0, 3.0, -4.0])
+            b = from_list([0.5, 0.5, 0.5, 0.5])
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, acc=acc, w=w, b=b)
+                acc += tensor_item(tensor_sum(tensor_relu(tensor_mul(tensor_mul(w, b, 0), b, 0)), -1))
+                n -= 1
+            return acc
+        before = kernels.counter.n
+        res = self.meta_interp(f, [10])
+        assert res == f(10)
+        import os
+        if 'RTENSOR_CPU' not in os.environ:
+            assert kernels.counter.n - before == 1
+
+
+class TestMultiOutput(LLJitMixin):
+
+    def test_intermediate_forced_later_becomes_extra_output(self):
+        driver = JitDriver(greens=[], reds=['n', 'w', 'b', 'h', 'acc'])
+        def f(n):
+            w = from_list([1.0, -2.0, 3.0, -4.0])
+            b = from_list([0.5, 0.5, 0.5, 0.5])
+            h = w
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, acc=acc, w=w, b=b, h=h)
+                h = tensor_relu(tensor_add(tensor_mul(h, b, 0), w, 0))
+                acc += tensor_item(tensor_sum(h, -1))
+                n -= 1
+            return acc
+        before = kernels.counter.n
+        res = self.meta_interp(f, [10])
+        assert res == f(10)
+        self.check_simple_loop(call_r=2, call_f=1)
+        import os
+        if 'RTENSOR_CPU' not in os.environ:
+            assert kernels.counter.n - before == 1
+        assert any(',o' in k for k in kernels.kernel_cache.kernels)
+
+
+class TestShapeSpecialization(LLJitMixin):
+
+    def setup_method(self, meth):
+        core.policy.static = True
+        core.policy.seen = []
+
+    def test_static_size_kernel_then_demotion(self):
+        driver = JitDriver(greens=[], reds=['n', 'size', 'w', 'b', 'acc'])
+        def f(n, size):
+            w = core.zeros([size])
+            b = core.zeros([size])
+            for i in range(size):
+                w.host[i] = i - 2.0
+                b.host[i] = 0.5
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, size=size, acc=acc, w=w, b=b)
+                h = ops.relu(ops.add(ops.mul(w, b), b))
+                if ops.tensor_shape(h, 0) == size:
+                    acc += ops.item(ops.sum(h))
+                n -= 1
+            return acc
+        res = self.meta_interp(f, [10, 8])
+        assert res == f(10, 8)
+        self.check_simple_loop(call_r=1)
+        self.check_resops(guard_value=2)
+        keys = [k for k in kernels.kernel_cache.kernels if k.split(',')[1] == '8']
+        assert keys
+        assert core.policy.static
+        for size in (16, 24, 40):
+            assert self.meta_interp(f, [10, size]) == f(10, size)
+        assert not core.policy.static
+        res = self.meta_interp(f, [10, 48])
+        assert res == f(10, 48)
+        self.check_resops(guard_value=0)
+        assert any(k.split(',')[1] == '0' for k in kernels.kernel_cache.kernels)
+
+
+def test_gpu_launch_matches_cpu():
+    k = kernels.build_kernel(2, [core.MUL, core.ADD, core.RELU, core.SUM],
+                             [0, 2, 3, 4], [1, 1, -1, -1],
+                             [0, 0, 0, core.AXIS_ALL])
+    if k.fn == 0:
+        import py
+        py.test.skip("no CUDA device / nvcc")
+    a = from_list([1.0, -2.0, 3.0, -4.0]); b = from_list([0.5, 0.5, 0.5, 0.5])
+    gpu = runtime.launch_gpu(k, [a, b])
+    assert gpu and device.host(gpu)[0] == 3.0
+    k.fn = 0
+    assert device.host(runtime.launch(k, a, b, core.NULLTENSOR))[0] == 3.0
+    assert '"tt.reduce"(%rm5)' in kernels.to_ttir(k, 'k')
+    k2 = kernels.build_kernel(2, [core.ADD, core.RELU], [0, 2], [1, -1],
+                                   [0, 0])
+    assert k2.fn != 0
+    r = runtime.launch_gpu(k2, [from_list([1.0, -2.0, 3.0]), from_list([0.5, 0.5, -4.0])])
+    assert not r.host and r.dptr != 0
+    assert [device.host(r)[i] for i in range(3)] == [1.5, 0.0, 0.0]
+
+def test_tile_ir_text():
+    k = kernels.build_kernel(2, [core.MUL, core.ADD, core.RELU, core.SUM],
+                             [0, 2, 3, 4], [1, 1, -1, -1],
+                             [0, 0, 0, core.AXIS_ALL])
+    out = runtime.launch(k, from_list([1.0, -2.0]), from_list([0.5, 0.5]),
+                         core.NULLTENSOR)
+    assert device.host(out)[0] == 1.0
+    text = kernels.to_tile_ir(k, 'k0', 2)
+    assert 'arith.mulf %v0, %v1' in text
+    assert 'cuda_tile.reduce add %v4' in text
+    assert text.count('cuda_tile.load_ptr_tko') == 2
+
+
+class TestBroadcast(LLJitMixin):
+
+    def setup_method(self, meth):
+        core.policy.static = True
+        core.policy.seen = []
+
+    def test_row_broadcast_fused(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'v', 'acc'])
+        def f(n):
+            x = core.zeros([3, 4])
+            v = core.zeros([4])
+            for i in range(12):
+                x.host[i] = i - 5.0
+            for i in range(4):
+                v.host[i] = i * 0.5
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, acc=acc, x=x, v=v)
+                h = ops.relu(ops.add(x, v))
+                acc += ops.item(ops.sum(h))
+                n -= 1
+            return acc
+        expect = 0.0
+        for i in range(12):
+            val = (i - 5.0) + (i % 4) * 0.5
+            if val > 0.0:
+                expect += val
+        before = kernels.counter.n
+        res = self.meta_interp(f, [10])
+        assert res == expect * 10
+        self.check_simple_loop(call_r=1)
+        assert any('0:0:1:1' in k for k in kernels.kernel_cache.kernels)
+        import os
+        if 'RTENSOR_CPU' not in os.environ:
+            assert kernels.counter.n > before
+
+    def test_conv_epilogue_fused(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'w', 's', 'r', 'acc'])
+        b, c, h, wd, o = 2, 16, 5, 4, 8
+        rows = b * h * wd
+        xv = _vals(rows * c)
+        wv = [v * 0.1 for v in _vals(9 * c * o, seed=5)]
+        sv = _vals(o, seed=2)
+        rv = _vals(rows * o, seed=3)
+        def f(n):
+            core.note_dtype(core.F32)
+            x = ops.reshape(from_list(xv, core.F32), [rows, c])
+            w = ops.reshape(from_list(wv, core.F32), [9 * c, o])
+            s = from_list(sv, core.F32)
+            r = ops.reshape(from_list(rv, core.F32), [rows, o])
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, acc=acc, x=x, w=w, s=s, r=r)
+                y = ops.conv(x, w, 1, c, h, wd, o, 3, 3, 1, 1, 1, 1, 1, 1)
+                t = ops.relu(ops.add(ops.mul(y, s), r))
+                acc += ops.item(ops.sum(t))
+                n -= 1
+            return acc
+        try:
+            expect = f(6)
+            res = self.meta_interp(f, [6])
+        finally:
+            core.note_dtype(core.F64)
+        assert abs(res - expect) <= 1e-3 * abs(expect)
+        self.check_simple_loop(call_r=2)
+        fused = [k for key, k in kernels.kernel_cache.kernels.items()
+                 if ',14:0:1:' in key and ',2:' in key]
+        assert fused
+        import os
+        if 'RTENSOR_CPU' not in os.environ:
+            assert fused[0].fn != 0
+
+    def test_two_convs_run_on_the_heavier_tiles(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'w1', 'w3', 'acc'])
+        b, c, h, wd, o = 1, 16, 4, 4, 8
+        rows = b * h * wd
+        xv = _vals(rows * c)
+        w1v = [v * 0.1 for v in _vals(c * o, seed=5)]
+        w3v = [v * 0.1 for v in _vals(9 * c * o, seed=3)]
+        def f(n):
+            core.note_dtype(core.F32)
+            x = ops.reshape(from_list(xv, core.F32), [rows, c])
+            w1 = ops.reshape(from_list(w1v, core.F32), [c, o])
+            w3 = ops.reshape(from_list(w3v, core.F32), [9 * c, o])
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, acc=acc, x=x, w1=w1, w3=w3)
+                a = ops.conv(x, w1, 1, c, h, wd, o, 1, 1, 1, 1, 0, 0, 1, 1)
+                y = ops.conv(x, w3, 1, c, h, wd, o, 3, 3, 1, 1, 1, 1, 1, 1)
+                t = ops.relu(ops.add(a, y))
+                acc += ops.item(ops.sum(t))
+                n -= 1
+            return acc
+        try:
+            expect = f(6)
+            res = self.meta_interp(f, [6])
+        finally:
+            core.note_dtype(core.F64)
+        assert abs(res - expect) <= 1e-3 * abs(expect)
+        self.check_simple_loop(call_r=2)
+        both = [key for key in kernels.kernel_cache.kernels
+                if key.count(',14:') == 2]
+        assert both
+        for key in both:
+            k = kernels.cached_kernel(key)
+            d = core.conv_descs.params[k.nodes[core.main_conv(k)].p]
+            assert d[5] == 3 and d[6] == 3
+            kernels.drop_kernel(key)
+
+    def test_conv_used_twice_runs_once(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'w', 's', 'acc'])
+        b, c, h, wd, o = 1, 16, 4, 4, 8
+        rows = b * h * wd
+        xv = _vals(rows * c)
+        wv = [v * 0.1 for v in _vals(c * o, seed=5)]
+        sv = _vals(o, seed=2)
+        def f(n):
+            core.note_dtype(core.F32)
+            x = ops.reshape(from_list(xv, core.F32), [rows, c])
+            w = ops.reshape(from_list(wv, core.F32), [c, o])
+            s = from_list(sv, core.F32)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, acc=acc, x=x, w=w, s=s)
+                y = ops.conv(x, w, 1, c, h, wd, o, 1, 1, 1, 1, 0, 0, 1, 1)
+                t = ops.add(ops.relu(y), ops.mul(y, s))
+                acc += ops.item(ops.sum(t))
+                n -= 1
+            return acc
+        try:
+            expect = f(6)
+            res = self.meta_interp(f, [6])
+        finally:
+            core.note_dtype(core.F64)
+        assert abs(res - expect) <= 1e-3 * abs(expect)
+        self.check_simple_loop(call_r=2)
+        fused = [key for key in kernels.kernel_cache.kernels
+                 if ',14:0:1:' in key and ',2:' in key]
+        assert fused
+        assert all(key.count(',14:') == 1 for key in fused)
+
+    def test_scalar_broadcast_fused(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 's', 'acc'])
+        def f(n):
+            x = core.zeros([3, 4])
+            for i in range(12):
+                x.host[i] = i - 5.0
+            s = from_list([2.0])
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, acc=acc, x=x, s=s)
+                h = ops.relu(ops.mul(x, s))
+                acc += ops.item(ops.sum(h))
+                n -= 1
+            return acc
+        expect = 0.0
+        for i in range(12):
+            val = (i - 5.0) * 2.0
+            if val > 0.0:
+                expect += val
+        res = self.meta_interp(f, [10])
+        assert res == expect * 10
+        self.check_simple_loop(call_r=1)
+
+    def test_sum_axis0_root(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'w', 'acc'])
+        def f(n):
+            x = core.zeros([3, 4])
+            w = core.zeros([4])
+            for i in range(12):
+                x.host[i] = i - 5.0
+            for i in range(4):
+                w.host[i] = 1.0 * (1 << i)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, acc=acc, x=x, w=w)
+                r = ops.sum(ops.relu(x), 0)
+                acc += ops.item(ops.sum(ops.mul(r, w)))
+                n -= 1
+            return acc
+        vals = [max(i - 5.0, 0.0) for i in range(12)]
+        expect = 0.0
+        for c in range(4):
+            for r in range(3):
+                expect += vals[r * 4 + c] * (1 << c)
+        res = self.meta_interp(f, [10])
+        assert res == expect * 10
+
+    def test_sum_axis1_root(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'w', 'acc'])
+        def f(n):
+            x = core.zeros([3, 4])
+            w = core.zeros([3])
+            for i in range(12):
+                x.host[i] = i - 5.0
+            for i in range(3):
+                w.host[i] = 1.0 * (1 << i)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, acc=acc, x=x, w=w)
+                r = ops.sum(ops.relu(x), 1)
+                acc += ops.item(ops.sum(ops.mul(r, w)))
+                n -= 1
+            return acc
+        vals = [max(i - 5.0, 0.0) for i in range(12)]
+        expect = 0.0
+        for r in range(3):
+            for c in range(4):
+                expect += vals[r * 4 + c] * (1 << r)
+        res = self.meta_interp(f, [10])
+        assert res == expect * 10
+
+    def test_broadcast_guard_inside_region_resumes(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'v', 'acc'])
+        def f(n):
+            x = core.zeros([3, 4])
+            v = core.zeros([4])
+            for i in range(12):
+                x.host[i] = i - 5.0
+            for i in range(4):
+                v.host[i] = i * 0.5
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, acc=acc, x=x, v=v)
+                t = ops.mul(x, v)
+                if n % 7 == 0:
+                    t = ops.add(t, v)
+                acc += ops.item(ops.sum(ops.relu(t)))
+                n -= 1
+            return acc
+        res = self.meta_interp(f, [30])
+        assert res == f(30)
+        from rpython.jit.metainterp.test.support import get_stats
+        assert get_stats().compiled_count >= 2
+
+    def test_reshape_then_elementwise(self):
+        driver = JitDriver(greens=[], reds=['n', 'm', 'v', 'acc'])
+        def f(n):
+            base = core.zeros([12])
+            for i in range(12):
+                base.host[i] = i - 5.0
+            m = ops.reshape(base, [3, 4])
+            v = core.zeros([4])
+            for i in range(4):
+                v.host[i] = i * 0.5
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, acc=acc, m=m, v=v)
+                h = ops.relu(ops.add(m, v))
+                acc += ops.item(ops.sum(h))
+                n -= 1
+            return acc
+        expect = 0.0
+        for i in range(12):
+            val = (i - 5.0) + (i % 4) * 0.5
+            if val > 0.0:
+                expect += val
+        res = self.meta_interp(f, [10])
+        assert res == expect * 10
+        self.check_simple_loop(call_r=1)
+
+    def test_inplace_keeps_fusion(self):
+        driver = JitDriver(greens=[], reds=['n', 'h', 'b'])
+        def f(n):
+            h = from_list([1.0, 2.0, 3.0])
+            b = from_list([0.5, -0.5, 0.25])
+            while n > 0:
+                driver.jit_merge_point(n=n, h=h, b=b)
+                h = ops.relu(ops.add_(h, b))
+                n -= 1
+            return ops.item(ops.sum(h))
+        res = self.meta_interp(f, [12])
+        assert res == f(12)
+        self.check_simple_loop(call_r=3)
+
+    def test_inplace_view_reflects_update(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'v', 'b', 'acc'])
+        def f(n):
+            x = from_list([1.0, 2.0, 3.0, 4.0])
+            b = from_list([0.5, -0.5, 0.25, -0.25])
+            device.dev(x)
+            v = ops.reshape(x, [2, 2])
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, v=v, b=b, acc=acc)
+                ops.add_(x, b)
+                acc += tensor_item(tensor_sum(v, -1))
+                n -= 1
+            return acc
+        expect = 0.0
+        vals = [1.0, 2.0, 3.0, 4.0]
+        delta = [0.5, -0.5, 0.25, -0.25]
+        for _ in range(5):
+            vals = [vals[i] + delta[i] for i in range(4)]
+            expect += sum(vals)
+        res = self.meta_interp(f, [5])
+        assert res == expect
+        assert res == f(5)
+
+
+def test_reshape_shares_storage():
+    t = from_list([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    v = ops.reshape(t, [2, 3])
+    assert v.size == 6 and v.shape[0] == 2 and v.shape[1] == 3
+    assert v.host is t.host and v.dptr == t.dptr
+    t.host[0] = 9.0
+    assert device.host(v)[0] == 9.0
+
+def test_assign_into_view_updates_base():
+    t = from_list([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    v = ops.reshape(t, [2, 3])
+    other = from_list([10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
+    ops.assign(v, other)
+    assert [device.host(t)[i] for i in range(6)] == \
+        [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+
+
+def test_assign_shape_mismatch_raises():
+    import py
+    a = from_list([1.0, 2.0])
+    b = from_list([1.0, 2.0, 3.0])
+    py.test.raises(ValueError, ops.assign, a, b)
+
+
+def test_add_on_requires_grad_leaf_raises():
+    import py
+    a = nn.Tensor(from_list([1.0, 2.0]), True)
+    b = nn.Tensor(from_list([0.5, 0.5]))
+    py.test.raises(ValueError, a.add_, b)
+    py.test.raises(ValueError, a.mul_, b)
+
+
+def test_sum_axis_elements():
+    x = core.zeros([3, 4])
+    for i in range(12):
+        x.host[i] = i - 5.0
+    vals = [i - 5.0 for i in range(12)]
+    r0 = ops.sum(x, 0)
+    assert r0.size == 4 and r0.shape[0] == 4
+    for c in range(4):
+        assert device.host(r0)[c] == sum([vals[r * 4 + c] for r in range(3)])
+    r1 = ops.sum(x, 1)
+    assert r1.size == 3 and r1.shape[0] == 3
+    for r in range(3):
+        assert device.host(r1)[r] == sum([vals[r * 4 + c] for c in range(4)])
+    assert ops.item(ops.sum(x)) == sum(vals)
+
+
+B, D = 2, 3
+LR = 0.01
+BACKWARD_CALL_R = 3
+
+def _fill_matrix(w, rows, cols, seed):
+    for i in range(rows):
+        for j in range(cols):
+            w.host[i * cols + j] = ((seed + i * 3 - j * 2) % 5 - 2) * 0.25
+
+def _fill_bias(b, seed):
+    for j in range(D):
+        b.host[j] = 0.125 * (j + 1) + seed * 0.0625
+
+def _make_layer(seed):
+    w = core.zeros([D, D])
+    b = core.zeros([D])
+    _fill_matrix(w, D, D, seed)
+    _fill_bias(b, seed)
+    return nn.Linear(nn.Tensor(w), nn.Tensor(b))
+
+def _make_mlp():
+    return nn.MLP([_make_layer(1), _make_layer(2), _make_layer(3)])
+
+def _cpu_matrix(seed):
+    return [[((seed + i * 3 - j * 2) % 5 - 2) * 0.25 for j in range(D)]
+            for i in range(D)]
+
+def _cpu_bias(seed):
+    return [0.125 * (j + 1) + seed * 0.0625 for j in range(D)]
+
+def _cpu_layer(x, seed):
+    w = _cpu_matrix(seed)
+    b = _cpu_bias(seed)
+    rows = len(x)
+    y = [[0.0] * D for _ in range(rows)]
+    for i in range(rows):
+        for j in range(D):
+            acc = 0.0
+            for k in range(D):
+                acc += x[i][k] * w[k][j]
+            v = acc + b[j]
+            y[i][j] = v if v > 0.0 else 0.0
+    return y
+
+def _cpu_mlp_step(x):
+    x = _cpu_layer(x, 1)
+    x = _cpu_layer(x, 2)
+    x = _cpu_layer(x, 3)
+    return x
+
+def _cpu_expect(n):
+    x0 = [[(i - j) * 0.5 for j in range(D)] for i in range(B)]
+    y = _cpu_mlp_step(x0)
+    return sum([sum(row) for row in y]) * n
+
+
+class TestTensorNN(LLJitMixin):
+
+    def test_mlp_forward_fuses_bias_relu(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'mlp', 'acc'])
+        def f(n):
+            x0 = core.zeros([B, D])
+            for i in range(B):
+                for j in range(D):
+                    x0.host[i * D + j] = (i - j) * 0.5
+            mlp = _make_mlp()
+            x = nn.Tensor(x0)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, mlp=mlp, acc=acc)
+                y = mlp.forward(x)
+                acc += y.sum().item()
+                n -= 1
+            return acc
+        res = self.meta_interp(f, [5])
+        assert res == _cpu_expect(5)
+        self.check_simple_loop(call_r=6)
+
+
+AB, AD = 2, 3
+AW = [1.0, -2.0, 0.5]
+ABIAS = [0.25, 0.5, -1.0]
+
+def _autograd_ref():
+    loss = 0.0
+    gw = [0.0] * AD
+    gb = [0.0] * AD
+    for i in range(AB):
+        for j in range(AD):
+            x = i * AD + j - 2.5
+            v = x * AW[j] + ABIAS[j]
+            if v > 0.0:
+                loss += v
+                gw[j] += x
+                gb[j] += 1.0
+    return loss, gw, gb
+
+def _autograd_setup():
+    x = core.zeros([AB, AD])
+    for i in range(AB * AD):
+        x.host[i] = i - 2.5
+    w = core.zeros([AD])
+    b = core.zeros([AD])
+    for j in range(AD):
+        w.host[j] = AW[j]
+        b.host[j] = ABIAS[j]
+    return x, w, b
+
+def test_autograd_elementwise_matches_reference():
+    x, w, b = _autograd_setup()
+    xt = nn.Tensor(x)
+    wt = nn.Tensor(w, True)
+    bt = nn.Tensor(b, True)
+    loss = xt.mul(wt).add(bt).relu().sum()
+    loss.backward()
+    eloss, egw, egb = _autograd_ref()
+    assert loss.item() == eloss
+    for j in range(AD):
+        assert device.host(wt.grad.t)[j] == egw[j]
+        assert device.host(bt.grad.t)[j] == egb[j]
+
+def _mlp_train_ref(iters, lr):
+    x = [[(i - j) * 0.5 for j in range(D)] for i in range(B)]
+    ws = [_cpu_matrix(1), _cpu_matrix(2)]
+    bs = [_cpu_bias(1), _cpu_bias(2)]
+    losses = []
+    for _ in range(iters):
+        acts = [x]
+        pre = []
+        h = x
+        for l in range(2):
+            y = [[sum([h[i][k] * ws[l][k][j] for k in range(D)]) + bs[l][j]
+                  for j in range(D)] for i in range(B)]
+            r = [[v if v > 0.0 else 0.0 for v in row] for row in y]
+            pre.append(y)
+            acts.append(r)
+            h = r
+        losses.append(sum([sum(row) for row in h]))
+        g = [[1.0] * D for _ in range(B)]
+        for l in (1, 0):
+            g = [[g[i][j] if pre[l][i][j] > 0.0 else 0.0 for j in range(D)]
+                 for i in range(B)]
+            gb = [sum([g[i][j] for i in range(B)]) for j in range(D)]
+            gw = [[sum([acts[l][i][k] * g[i][j] for i in range(B)])
+                   for j in range(D)] for k in range(D)]
+            gx = [[sum([g[i][j] * ws[l][k][j] for j in range(D)])
+                   for k in range(D)] for i in range(B)]
+            for k in range(D):
+                for j in range(D):
+                    ws[l][k][j] -= lr * gw[k][j]
+            for j in range(D):
+                bs[l][j] -= lr * gb[j]
+            g = gx
+    return losses
+
+
+class TestAutograd(LLJitMixin):
+
+    def setup_method(self, meth):
+        core.policy.static = True
+        core.policy.seen = []
+
+    def test_backward_of_relu_mul_add_fuses(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'w', 'b', 'acc'])
+        def f(n):
+            x, w, b = _autograd_setup()
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, w=w, b=b, acc=acc)
+                xt = nn.Tensor(x)
+                wt = nn.Tensor(w, True)
+                bt = nn.Tensor(b, True)
+                loss = xt.mul(wt).add(bt).relu().sum()
+                loss.backward()
+                acc += (loss.item() + 3.0 * wt.grad.sum().item() +
+                        7.0 * bt.grad.sum().item())
+                n -= 1
+            return acc
+        eloss, egw, egb = _autograd_ref()
+        expect = (eloss + 3.0 * sum(egw) + 7.0 * sum(egb)) * 10
+        res = self.meta_interp(f, [10])
+        assert res == expect
+        self.check_simple_loop(call_r=BACKWARD_CALL_R, call_f=3)
+
+    def test_mlp_train_step_matches_reference(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'mlp', 'lr', 'loss', 'prev'])
+        def f(n):
+            x0 = core.zeros([B, D])
+            for i in range(B):
+                for j in range(D):
+                    x0.host[i * D + j] = (i - j) * 0.5
+            mlp = nn.MLP([_make_layer(1), _make_layer(2)])
+            x = nn.Tensor(x0)
+            lr = nn.Tensor(core.from_list([-LR]))
+            params = mlp.parameters()
+            loss = 0.0
+            prev = 1e30
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, mlp=mlp, lr=lr, loss=loss,
+                                       prev=prev)
+                y = mlp.forward(x)
+                out = y.reshape([B * D]).sum()
+                out.backward()
+                nn.sgd_step(mlp.parameters(), lr)
+                loss = out.item()
+                if loss >= prev:
+                    return -1.0
+                prev = loss
+                n -= 1
+            return loss
+        losses = _mlp_train_ref(6, LR)
+        assert losses[0] > losses[-1]
+        res = self.meta_interp(f, [6])
+        assert abs(res - losses[-1]) < 1e-9
+
+
+TD, TH, TROWS = 8, 2, 4
+TEPS = 1e-05
+
+
+def _init_weight(rows, cols):
+    t = core.zeros([rows, cols])
+    for i in range(rows * cols):
+        t.host[i] = float((i * 7) % 13 - 6) / TD
+    return t
+
+
+def _ref_weight(rows, cols):
+    return [[float((i * cols + j) * 7 % 13 - 6) / TD for j in range(cols)]
+            for i in range(rows)]
+
+
+def _ref_matmul(a, b):
+    return [[sum([a[i][k] * b[k][j] for k in range(len(b))])
+             for j in range(len(b[0]))] for i in range(len(a))]
+
+
+def _ref_transpose(m):
+    return [[m[i][j] for i in range(len(m))] for j in range(len(m[0]))]
+
+
+def _ref_gelu(v):
+    u = math.sqrt(2.0 / math.pi) * (v + 0.044715 * v * v * v)
+    return 0.5 * v * (1.0 + math.tanh(u))
+
+
+def _ref_softmax(m):
+    out = []
+    for row in m:
+        top = max(row)
+        e = [math.exp(v - top) for v in row]
+        tot = sum(e)
+        out.append([v / tot for v in e])
+    return out
+
+
+def _ref_layernorm(m, gamma, beta):
+    out = []
+    for row in m:
+        c = len(row)
+        mu = sum(row) / float(c)
+        var = sum([(v - mu) ** 2 for v in row]) / float(c)
+        den = math.sqrt(var + TEPS)
+        out.append([(row[j] - mu) / den * gamma[j] + beta[j]
+                    for j in range(c)])
+    return out
+
+
+def _ref_input(rows, cols):
+    return [[((i * cols + j) % 7) - 3.0 for j in range(cols)]
+            for i in range(rows)]
+
+
+def _ref_block(x):
+    dh = TD // TH
+    gamma = [1.0] * TD
+    beta = [0.0] * TD
+    h = _ref_layernorm(x, gamma, beta)
+    acc = None
+    for _ in range(TH):
+        q = _ref_matmul(h, _ref_weight(TD, dh))
+        k = _ref_matmul(h, _ref_weight(TD, dh))
+        v = _ref_matmul(h, _ref_weight(TD, dh))
+        scores = _ref_matmul(q, _ref_transpose(k))
+        scale = 1.0 / math.sqrt(dh)
+        scores = [[c * scale for c in row] for row in scores]
+        head = _ref_matmul(_ref_softmax(scores), v)
+        head = _ref_matmul(head, _ref_weight(dh, TD))
+        if acc is None:
+            acc = head
+        else:
+            acc = [[acc[i][j] + head[i][j] for j in range(TD)]
+                   for i in range(len(acc))]
+    x = [[x[i][j] + acc[i][j] for j in range(TD)] for i in range(len(x))]
+    h2 = _ref_layernorm(x, gamma, beta)
+    y = h2
+    for _ in range(2):
+        y = _ref_matmul(y, _ref_weight(TD, TD))
+        y = [[max(v + 0.01, 0.0) for v in row] for row in y]
+    return [[x[i][j] + y[i][j] for j in range(TD)] for i in range(len(x))]
+
+
+def _qkv_weight():
+    dh = TD // TH
+    t = core.zeros([TD, TD])
+    for r in range(TD):
+        for h in range(TH):
+            for c in range(dh):
+                t.host[r * TD + h * dh + c] = float(
+                    ((r * dh + c) * 7) % 13 - 6) / TD
+    return t
+
+
+def _proj_weight():
+    dh = TD // TH
+    t = core.zeros([TD, TD])
+    for h in range(TH):
+        for r in range(dh):
+            for c in range(TD):
+                t.host[(h * dh + r) * TD + c] = float(
+                    ((r * TD + c) * 7) % 13 - 6) / TD
+    return t
+
+
+def _make_block(rg=False):
+    attn = nn.MultiHead(
+        nn.Tensor(_qkv_weight()), nn.Tensor(_qkv_weight()),
+        nn.Tensor(_qkv_weight()), nn.Tensor(_proj_weight()),
+        TH, rg)
+    layers = []
+    for _ in range(2):
+        bias = core.zeros([TD])
+        for i in range(TD):
+            bias.host[i] = 0.01
+        layers.append(nn.Linear(
+            nn.Tensor(_init_weight(TD, TD)),
+            nn.Tensor(bias)))
+    ones = core.zeros([TD])
+    for i in range(TD):
+        ones.host[i] = 1.0
+    zeros = core.zeros([TD])
+    for i in range(TD):
+        zeros.host[i] = 0.0
+    return nn.TransformerBlock(
+        attn, nn.Tensor(ones), nn.Tensor(zeros),
+        nn.Tensor(ones), nn.Tensor(zeros),
+        nn.MLP(layers), TEPS, rg)
+
+
+class TestTransformer(LLJitMixin):
+
+    def setup_method(self, meth):
+        core.policy.static = True
+        core.policy.seen = []
+
+    def test_softmax_rows(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'w', 'acc'])
+        def f(n):
+            x = core.zeros([3, 4])
+            for i in range(12):
+                x.host[i] = ((i * i) % 7) - 3.0 + i * 0.5
+            w = core.zeros([4])
+            for i in range(4):
+                w.host[i] = 1.0 * (1 << i)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, w=w, acc=acc)
+                s = nn.softmax(nn.Tensor(x))
+                acc += ops.item(ops.sum(ops.mul(s.t, w)))
+                n -= 1
+            return acc
+        before = set(kernels.kernel_cache.kernels)
+        rows = [[((i * 4 + j) * (i * 4 + j)) % 7 - 3.0 + (i * 4 + j) * 0.5
+                 for j in range(4)] for i in range(3)]
+        ref = _ref_softmax(rows)
+        expect = 0.0
+        for i in range(3):
+            for j in range(4):
+                expect += ref[i][j] * (1 << j)
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+        self.check_simple_loop(call_r=1)
+        self.check_resops(guard_value=3)
+        added = set(kernels.kernel_cache.kernels) - before
+        assert len(added) == 1
+        assert added.pop().split(',')[2] == 'r32'
+
+    def test_logsumexp_rows(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'w', 'acc'])
+        def f(n):
+            x = core.zeros([3, 4])
+            for i in range(12):
+                x.host[i] = ((i * i) % 7) - 3.0 + i * 0.5
+            w = core.zeros([3])
+            for i in range(3):
+                w.host[i] = 1.0 * (1 << i)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, w=w, acc=acc)
+                s = nn.logsumexp(nn.Tensor(x))
+                acc += ops.item(ops.sum(ops.mul(s.t, w)))
+                n -= 1
+            return acc
+        before = set(kernels.kernel_cache.kernels)
+        unfused = device.unfused_count()
+        expect = 0.0
+        for i in range(3):
+            row = [((i * 4 + j) * (i * 4 + j)) % 7 - 3.0 + (i * 4 + j) * 0.5
+                   for j in range(4)]
+            m = max(row)
+            expect += (m + math.log(sum([math.exp(v - m) for v in row]))) * (
+                1 << i)
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+        self.check_simple_loop(call_r=2)
+        added = set(kernels.kernel_cache.kernels) - before
+        lse = [key for key in added
+               if '9:0:-1:1' in key and '3:3:-1:1' in key]
+        assert len(lse) == 1
+        assert ttir.all_modes(kernels.kernel_cache.kernels[lse[0]])
+        assert device.unfused_count() == unfused
+
+    def test_log_softmax_rows(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'w', 'acc'])
+        def f(n):
+            x = core.zeros([3, 4])
+            for i in range(12):
+                x.host[i] = ((i * i) % 7) - 3.0 + i * 0.5
+            w = core.zeros([4])
+            for i in range(4):
+                w.host[i] = 1.0 * (1 << i)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, w=w, acc=acc)
+                s = nn.log_softmax(nn.Tensor(x))
+                acc += ops.item(ops.sum(ops.mul(s.t, w)))
+                n -= 1
+            return acc
+        before = set(kernels.kernel_cache.kernels)
+        expect = 0.0
+        for i in range(3):
+            row = [((i * 4 + j) * (i * 4 + j)) % 7 - 3.0 + (i * 4 + j) * 0.5
+                   for j in range(4)]
+            m = max(row)
+            lse = m + math.log(sum([math.exp(v - m) for v in row]))
+            for j in range(4):
+                expect += (row[j] - lse) * (1 << j)
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+        self.check_simple_loop(call_r=1)
+        added = set(kernels.kernel_cache.kernels) - before
+        assert len(added) == 1
+
+    def test_layernorm_rows(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'g', 'b', 'w', 'acc'])
+        def f(n):
+            x = core.zeros([3, 4])
+            for i in range(12):
+                x.host[i] = ((i * i) % 7) - 3.0 + i * 0.5
+            g = core.zeros([4])
+            b = core.zeros([4])
+            w = core.zeros([4])
+            for i in range(4):
+                g.host[i] = 1.0 + i * 0.5
+                b.host[i] = i * 0.25
+                w.host[i] = 1.0 * (1 << i)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, g=g, b=b, w=w, acc=acc)
+                y = nn.layernorm(nn.Tensor(x),
+                                         nn.Tensor(g),
+                                         nn.Tensor(b), TEPS)
+                acc += ops.item(ops.sum(ops.mul(y.t, w)))
+                n -= 1
+            return acc
+        before = set(kernels.kernel_cache.kernels)
+        rows = [[((i * 4 + j) * (i * 4 + j)) % 7 - 3.0 + (i * 4 + j) * 0.5
+                 for j in range(4)] for i in range(3)]
+        ref = _ref_layernorm(rows, [1.0 + j * 0.5 for j in range(4)],
+                             [j * 0.25 for j in range(4)])
+        expect = 0.0
+        for i in range(3):
+            for j in range(4):
+                expect += ref[i][j] * (1 << j)
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+        self.check_simple_loop(call_r=1)
+        added = set(kernels.kernel_cache.kernels) - before
+        assert len(added) == 1
+        key = added.pop()
+        assert key.split(',')[2] == 'r32' and key.split(',')[0] == '4'
+
+    def test_gelu_fuses_one_kernel(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'w', 'acc'])
+        def f(n):
+            x = core.zeros([3, 4])
+            for i in range(12):
+                x.host[i] = (i % 7) - 3.0
+            w = core.zeros([4])
+            for i in range(4):
+                w.host[i] = 1.0 * (1 << i)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, w=w, acc=acc)
+                y = nn.gelu(nn.Tensor(x))
+                acc += ops.item(ops.sum(ops.mul(y.t, w)))
+                n -= 1
+            return acc
+        before = set(kernels.kernel_cache.kernels)
+        expect = 0.0
+        for i in range(12):
+            expect += _ref_gelu((i % 7) - 3.0) * (1 << (i % 4))
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+        self.check_simple_loop(call_r=1)
+        assert len(set(kernels.kernel_cache.kernels) - before) == 1
+
+    def test_silu_fuses_one_kernel(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'w', 'acc'])
+        def f(n):
+            x = core.zeros([3, 4])
+            for i in range(12):
+                x.host[i] = (i % 7) - 3.0
+            w = core.zeros([4])
+            for i in range(4):
+                w.host[i] = 1.0 * (1 << i)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, w=w, acc=acc)
+                y = nn.silu(nn.Tensor(x))
+                acc += ops.item(ops.sum(ops.mul(y.t, w)))
+                n -= 1
+            return acc
+        before = set(kernels.kernel_cache.kernels)
+        expect = 0.0
+        for i in range(12):
+            v = (i % 7) - 3.0
+            expect += v / (1.0 + math.exp(-v)) * (1 << (i % 4))
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+        self.check_simple_loop(call_r=1)
+        assert len(set(kernels.kernel_cache.kernels) - before) == 1
+
+    def test_rmsnorm_rows_one_kernel(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'g', 'w', 'acc'])
+        def f(n):
+            x = core.zeros([3, 4])
+            for i in range(12):
+                x.host[i] = ((i * i) % 7) - 3.0 + i * 0.5
+            g = core.zeros([4])
+            w = core.zeros([4])
+            for i in range(4):
+                g.host[i] = 1.0 + i * 0.5
+                w.host[i] = 1.0 * (1 << i)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, g=g, w=w, acc=acc)
+                y = nn.rmsnorm(nn.Tensor(x), nn.Tensor(g), TEPS)
+                acc += ops.item(ops.sum(ops.mul(y.t, w)))
+                n -= 1
+            return acc
+        before = set(kernels.kernel_cache.kernels)
+        rows = [[((i * 4 + j) * (i * 4 + j)) % 7 - 3.0 + (i * 4 + j) * 0.5
+                 for j in range(4)] for i in range(3)]
+        expect = 0.0
+        for i in range(3):
+            ms = 0.0
+            for j in range(4):
+                ms += rows[i][j] * rows[i][j]
+            denom = math.sqrt(ms / 4.0 + TEPS)
+            for j in range(4):
+                expect += rows[i][j] / denom * (1.0 + j * 0.5) * (1 << j)
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+        self.check_simple_loop(call_r=1)
+        added = set(kernels.kernel_cache.kernels) - before
+        assert len(added) == 1
+        key = added.pop()
+        assert key.split(',')[0] == '3'
+
+    def test_attn_scores_context_match_head_split(self):
+        heads, rows, dh = 3, 4, 2
+        d = heads * dh
+        q = core.zeros([rows, d])
+        k = core.zeros([rows, d])
+        v = core.zeros([rows, d])
+        for i in range(rows * d):
+            q.host[i] = (i % 5) - 2.0
+            k.host[i] = ((i * 3) % 7) - 3.0
+            v.host[i] = ((i * 5) % 11) - 5.0
+        qs = nn.Tensor(runtime.head_split(q, rows, dh, heads))
+        ks = nn.Tensor(runtime.head_split(k, rows, dh, heads))
+        vs = nn.Tensor(runtime.head_split(v, rows, dh, heads))
+        ref_s = qs.bmm(ks, heads, rows, rows, dh, 1)
+        got_s = nn.Tensor(q).attn_scores(nn.Tensor(k), heads, rows, dh)
+        hr = device.host(ref_s.t)
+        hg = device.host(got_s.t)
+        assert ops.tensor_size(got_s.t) == heads * rows * rows
+        for i in range(heads * rows * rows):
+            assert abs(hr[i] - hg[i]) < 1e-9
+        ref_c = runtime.head_merge(ref_s.bmm(vs, heads, rows, dh, rows, 0).t,
+                                   rows, dh, heads)
+        got_c = got_s.attn_context(nn.Tensor(v), heads, rows, dh)
+        hr = device.host(ref_c)
+        hg = device.host(got_c.t)
+        assert ops.tensor_size(got_c.t) == rows * d
+        assert ops.tensor_shape(got_c.t, 1) == d
+        for i in range(rows * d):
+            assert abs(hr[i] - hg[i]) < 1e-9
+
+    def test_attn_batched_matches_per_sequence(self):
+        """seqs > 1 folds B sequences into the rows. Attention across a boundary or a wrong outer stride would mismatch."""
+        seqs, heads, rows, dh = 3, 2, 4, 2
+        d = heads * dh
+        per = rows * 3 * d
+        qkv = core.zeros([seqs * rows, 3 * d])
+        for i in range(seqs * per):
+            qkv.host[i] = (((i * 7) % 13) - 6) / 4.0
+        f = nn.Tensor(qkv)
+        got_s = f.attn_scores(f, heads, rows, dh, 3 * d, 3 * d, 0, d, seqs)
+        got_c = got_s.attn_context(f, heads, rows, dh, 3 * d, 2 * d, seqs)
+        assert ops.tensor_shape(got_s.t, 0) == seqs * heads * rows
+        assert ops.tensor_shape(got_s.t, 1) == rows
+        assert ops.tensor_shape(got_c.t, 0) == seqs * rows
+        assert ops.tensor_shape(got_c.t, 1) == d
+        hs = device.host(got_s.t)
+        hc = device.host(got_c.t)
+        for b in range(seqs):
+            one = core.zeros([rows, 3 * d])
+            for i in range(per):
+                one.host[i] = qkv.host[b * per + i]
+            g = nn.Tensor(one)
+            ref_s = g.attn_scores(g, heads, rows, dh, 3 * d, 3 * d, 0, d)
+            ref_c = ref_s.attn_context(g, heads, rows, dh, 3 * d, 2 * d)
+            hrs = device.host(ref_s.t)
+            for i in range(heads * rows * rows):
+                assert abs(hrs[i] - hs[b * heads * rows * rows + i]) < 1e-9
+            hrc = device.host(ref_c.t)
+            for i in range(rows * d):
+                assert abs(hrc[i] - hc[b * rows * d + i]) < 1e-9
+
+    def test_bmm_outer_batch_matches_separate_calls(self):
+        """The outer level of tensor_bmm is nb2 groups of `batch` matrices, each must match a separate call."""
+        nb2, batch, rows, cols, inner = 2, 3, 2, 3, 4
+        a = core.zeros([nb2 * batch * rows, inner])
+        b = core.zeros([nb2 * batch * inner, cols])
+        for i in range(nb2 * batch * rows * inner):
+            a.host[i] = ((i * 3) % 7) - 3.0
+        for i in range(nb2 * batch * inner * cols):
+            b.host[i] = ((i * 5) % 11) - 5.0
+        sa, sb, sc = rows * inner, inner * cols, rows * cols
+        got = runtime.tensor_bmm(a, b, batch, rows, cols, inner, 0, 0,
+                                 0, 0, 0, sa, sb, sc, 0, 0, 0, 0, 0, 0,
+                                 nb2, batch * sa, batch * sb, batch * sc)
+        assert ops.tensor_size(got) == nb2 * batch * rows * cols
+        hg = device.host(got)
+        for g in range(nb2):
+            ref = runtime.tensor_bmm(a, b, batch, rows, cols, inner, 0, 0,
+                                     0, 0, 0, sa, sb, sc, 0, 0,
+                                     g * batch * sa, g * batch * sb, 0)
+            hr = device.host(ref)
+            for i in range(batch * rows * cols):
+                assert abs(hr[i] - hg[g * batch * sc + i]) < 1e-9
+
+    def test_bmm_outer_batch_interleaved_matches_separate_calls(self):
+        """Attention layout: the outer stride is not batch*sa, so only the pointer array encodes it in one call.
+
+        nb2 >= 2 and batch >= 2 so the two levels stay distinguishable."""
+        nb2, batch, rows, cols, inner = 3, 2, 2, 3, 4
+        lda = batch * inner
+        ldb = batch * cols
+        sa, sb = inner, cols
+        sa2, sb2 = rows * lda, inner * ldb
+        sc, sc2 = rows * cols, batch * rows * cols
+        a = core.zeros([nb2 * rows, lda])
+        b = core.zeros([nb2 * inner, ldb])
+        for i in range(nb2 * rows * lda):
+            a.host[i] = ((i * 3) % 7) - 3.0
+        for i in range(nb2 * inner * ldb):
+            b.host[i] = ((i * 5) % 11) - 5.0
+        got = runtime.tensor_bmm(a, b, batch, rows, cols, inner, 0, 0,
+                                 lda, ldb, cols, sa, sb, sc, 0, 0, 0, 0, 0,
+                                 0, nb2, sa2, sb2, sc2)
+        assert ops.tensor_size(got) == nb2 * batch * rows * cols
+        hg = device.host(got)
+        for g in range(nb2):
+            ref = runtime.tensor_bmm(a, b, batch, rows, cols, inner, 0, 0,
+                                     lda, ldb, cols, sa, sb, sc, 0, 0,
+                                     g * sa2, g * sb2, 0)
+            hr = device.host(ref)
+            for i in range(batch * rows * cols):
+                assert abs(hr[i] - hg[g * sc2 + i]) < 1e-9
+
+    def test_attn_strided_matches_dense(self):
+        heads, rows, dh = 3, 4, 2
+        d = heads * dh
+        q = core.zeros([rows, d])
+        k = core.zeros([rows, d])
+        v = core.zeros([rows, d])
+        qkv = core.zeros([rows, 3 * d])
+        for i in range(rows * d):
+            q.host[i] = (i % 5) - 2.0
+            k.host[i] = ((i * 3) % 7) - 3.0
+            v.host[i] = ((i * 5) % 11) - 5.0
+        for r in range(rows):
+            for j in range(d):
+                qkv.host[r * 3 * d + j] = q.host[r * d + j]
+                qkv.host[r * 3 * d + d + j] = k.host[r * d + j]
+                qkv.host[r * 3 * d + 2 * d + j] = v.host[r * d + j]
+        ref_s = nn.Tensor(q).attn_scores(nn.Tensor(k), heads, rows, dh)
+        f = nn.Tensor(qkv)
+        got_s = f.attn_scores(f, heads, rows, dh, 3 * d, 3 * d, 0, d)
+        hr = device.host(ref_s.t)
+        hg = device.host(got_s.t)
+        for i in range(heads * rows * rows):
+            assert abs(hr[i] - hg[i]) < 1e-9
+        ref_c = ref_s.attn_context(nn.Tensor(v), heads, rows, dh)
+        got_c = got_s.attn_context(f, heads, rows, dh, 3 * d, 2 * d)
+        hr = device.host(ref_c.t)
+        hg = device.host(got_c.t)
+        assert ops.tensor_size(got_c.t) == rows * d
+        for i in range(rows * d):
+            assert abs(hr[i] - hg[i]) < 1e-9
+
+    def test_rot_half_matches_permutation(self):
+        rows, dh, blocks = 3, 4, 2
+        d = dh * blocks
+        x = core.zeros([rows, d])
+        for i in range(rows * d):
+            x.host[i] = (i % 9) - 4.0
+        y = device.host(runtime.rot_half(x, dh))
+        half = dh // 2
+        for r in range(rows):
+            for b in range(blocks):
+                o = r * d + b * dh
+                for j in range(dh):
+                    assert y[o + j] == x.host[o + (j + half) % dh]
+
+    def test_transformer_block_forward(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'block', 'acc'])
+        def f(n):
+            x0 = core.zeros([TROWS, TD])
+            for i in range(TROWS * TD):
+                x0.host[i] = (i % 7) - 3.0
+            block = _make_block()
+            x = nn.Tensor(x0)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, block=block, acc=acc)
+                y = block.forward(x)
+                acc += y.sum().item()
+                n -= 1
+            return acc
+        ref = _ref_block(_ref_input(TROWS, TD))
+        expect = sum([sum(row) for row in ref]) * 5
+        before = set(kernels.kernel_cache.kernels)
+        res = self.meta_interp(f, [5])
+        assert abs(res - expect) < 1e-9
+        self.check_simple_loop(call_r=14)
+        added = set(kernels.kernel_cache.kernels) - before
+        assert len([k for k in added if k.split(',')[2].startswith('r')]) == 3
+
+    def test_row_kernel_specialised_per_column_count(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'acc'])
+        def f(n, c):
+            x = core.zeros([2, c])
+            for i in range(2 * c):
+                x.host[i] = (i % 5) - 2.0
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, acc=acc)
+                s = nn.softmax(nn.Tensor(x))
+                acc += ops.item(ops.sum(s.t))
+                n -= 1
+            return acc
+        core.policy.static_cols = True
+        core.policy.seen_cols = []
+        try:
+            tiles = []
+            for c in (4, 40, 5, 48, 9):
+                before = set(kernels.kernel_cache.kernels)
+                res = self.meta_interp(f, [10, c])
+                assert abs(res - 20.0) < 1e-9
+                assert abs(f(10, c) - 20.0) < 1e-9
+                added = set(kernels.kernel_cache.kernels) - before
+                for key in added:
+                    part = key.split(',')[2]
+                    if part.startswith('r'):
+                        tiles.append(part)
+            assert 'r32' in tiles
+            assert 'r64' in tiles
+            assert not core.policy.static_cols
+            assert tiles[len(tiles) - 1] == 'r%d' % core.config.block
+        finally:
+            core.policy.static_cols = True
+            core.policy.seen_cols = []
+
+
+def _filled(shape, base):
+    t = core.zeros(shape)
+    for i in range(t.size):
+        t.host[i] = base + i
+    return t
+
+
+def test_wide_column_broadcast_stays_on_gpu():
+    assert not kernels.single_kernel(core.MUL, core.BC_R_COL,
+                                     core.policy.dtype).rowmode
+    c = kernels.config.block + 1
+    x = _filled([2, c], 1.0)
+    col = _filled([2, 1], 0.5)
+    r = ops.mul(x, col)
+    h = device.host(r)
+    assert h[0] == 1.0 * 0.5
+    assert h[c] == (1.0 + c) * 1.5
+
+
+def test_launch_gpu_rejects_undersized_operand():
+    kernel = kernels.single_kernel(core.DIV, core.BC_NONE, core.policy.dtype)
+    big = _filled([256, 64], 1.0)
+    small = _filled([256, 1], 2.0)
+    before = device.launch_count()
+    assert not runtime.launch_gpu(kernel, [big, small])
+    assert device.launch_count() == before
+    if kernel.fn != 0:
+        assert runtime.launch_gpu(kernel, [big, _filled([256, 64], 2.0)])
+        assert device.launch_count() == before + 1
+
+
+def test_broadcast_extra_output_keeps_its_own_size():
+    rows, cols = 8, 64
+    kernel = kernels.new_kernel(2, 2, core.policy.dtype)
+    kernels.set_node(kernel, 0, core.MUL, 1, 1, core.BC_NONE)
+    kernels.set_node(kernel, 1, core.DIV, 0, 2, core.BC_R_COL)
+    kernels.add_output(kernel, 2)
+    kernels.compile_or_reuse(kernel)
+    if kernel.fn == 0:
+        return
+    big = _filled([rows, cols], 1.0)
+    col = _filled([rows], 2.0)
+    r = runtime.launch_gpu(kernel, [big, col])
+    assert r
+    assert r.size == rows * cols
+    extra = r.extra[0]
+    assert extra.size == rows
+    h = device.host(extra)
+    for i in range(rows):
+        assert h[i] == (2.0 + i) * (2.0 + i)
+
+
+def test_column_broadcast_shapes():
+    x = _filled([3, 4], 1.0)
+    assert ops.bcast(x, _filled([4], 0.5)) == core.BC_R_ROW
+    assert ops.bcast(x, _filled([3], 0.5)) == core.BC_R_COL
+    assert ops.bcast(x, _filled([3, 1], 0.5)) == core.BC_R_COL
+    assert ops.bcast(_filled([3], 0.5), x) == core.BC_L_COL
+    assert ops.bcast(x, _filled([1], 2.0)) == core.BC_R_SCALAR
+    sq = _filled([4, 4], 1.0)
+    assert ops.bcast(sq, _filled([4], 0.5)) == core.BC_R_ROW
+    assert ops.bcast(sq, _filled([4, 1], 0.5)) == core.BC_R_COL
+    col = _filled([3, 1], 0.5)
+    r = ops.sub(x, col)
+    for i in range(3):
+        for j in range(4):
+            assert device.host(r)[i * 4 + j] == (1.0 + i * 4 + j) - (0.5 + i)
+    d = ops.div(x, col)
+    assert device.host(d)[5] == (1.0 + 5) / (0.5 + 1)
+    assert ops.item(ops.max(x)) == 12.0
+    m = ops.max(x, 1)
+    assert [device.host(m)[i] for i in range(3)] == [4.0, 8.0, 12.0]
+    assert [device.host(ops.max(x, 0))[j] for j in range(4)] == \
+        [9.0, 10.0, 11.0, 12.0]
+    assert device.host(ops.sqrt(_filled([2], 4.0)))[0] == 2.0
+    assert device.host(ops.exp(_filled([1], 0.0)))[0] == 1.0
+
+
+CN, CC, CH, CW, CO, CNCLS = 2, 3, 8, 8, 4, 10
+CEPS = 1e-05
+
+
+def _conv_weight(rows, cols):
+    return [float((i * 7) % 13 - 6) / rows for i in range(rows * cols)]
+
+
+def _conv_input(n, c, h, w):
+    return [float(i % 7) - 3.0 for i in range(n * c * h * w)]
+
+
+def _ref_im2col(x, n, c, h, w, k, pad):
+    out = []
+    for i in range(n):
+        for ph in range(h):
+            for pw in range(w):
+                for cc in range(c):
+                    for r in range(k):
+                        for s in range(k):
+                            ih = ph + r - pad
+                            iw = pw + s - pad
+                            if 0 <= ih < h and 0 <= iw < w:
+                                out.append(x[i * c * h * w + cc * h * w +
+                                             ih * w + iw])
+                            else:
+                                out.append(0.0)
+    return out
+
+
+def _ref_maxpool2(x, n, c, h, w):
+    out = []
+    for i in range(n):
+        for cc in range(c):
+            for oh in range(h // 2):
+                for ow in range(w // 2):
+                    b = i * c * h * w + cc * h * w + 2 * oh * w + 2 * ow
+                    out.append(max(x[b], x[b + 1], x[b + w], x[b + w + 1]))
+    return out
+
+
+def _ref_im2col_nhwc(x, n, c, h, w, k, pad, stride):
+    oh = (h + 2 * pad - k) // stride + 1
+    ow = (w + 2 * pad - k) // stride + 1
+    out = []
+    for i in range(n):
+        for ph in range(oh):
+            for pw in range(ow):
+                for a in range(k):
+                    for b in range(k):
+                        for cc in range(c):
+                            ih = ph * stride + a - pad
+                            iw = pw * stride + b - pad
+                            if 0 <= ih < h and 0 <= iw < w:
+                                out.append(x[((i * h + ih) * w + iw) * c + cc])
+                            else:
+                                out.append(0.0)
+    return out
+
+
+def _ref_maxpool_nhwc(x, n, c, h, w, k, stride, pad):
+    oh = (h + 2 * pad - k) // stride + 1
+    ow = (w + 2 * pad - k) // stride + 1
+    out = []
+    for i in range(n):
+        for ph in range(oh):
+            for pw in range(ow):
+                for cc in range(c):
+                    m = None
+                    for a in range(k):
+                        ih = min(max(ph * stride + a - pad, 0), h - 1)
+                        for b in range(k):
+                            iw = min(max(pw * stride + b - pad, 0), w - 1)
+                            v = x[((i * h + ih) * w + iw) * c + cc]
+                            if m is None or v > m:
+                                m = v
+                    out.append(m)
+    return out
+
+
+class TestNHWCGathers(object):
+
+    def _check_im2col(self, n, c, h, w, k, pad, stride):
+        vals = [float((i * 7) % 13) - 6.0 for i in range(n * h * w * c)]
+        x = _load([n * h * w, c], vals)
+        got = device.host(runtime.im2col_nhwc(x, c, h, w, k, pad, stride))
+        want = _ref_im2col_nhwc(vals, n, c, h, w, k, pad, stride)
+        assert [got[i] for i in range(len(want))] == want
+
+    def test_im2col_nhwc_k7_s2_p3(self):
+        self._check_im2col(1, 3, 9, 9, 7, 3, 2)
+
+    def test_im2col_nhwc_k3_s1_p1(self):
+        self._check_im2col(2, 4, 5, 6, 3, 1, 1)
+
+    def test_im2col_nhwc_k3_s2_p1(self):
+        self._check_im2col(2, 4, 7, 7, 3, 1, 2)
+
+    def test_im2col_nhwc_k1_s2(self):
+        self._check_im2col(2, 5, 8, 8, 1, 0, 2)
+
+    def test_maxpool_nhwc_k3_s2_p1(self):
+        n, c, h, w, k, stride, pad = 2, 3, 7, 7, 3, 2, 1
+        vals = [float((i * 5) % 11) for i in range(n * h * w * c)]
+        x = _load([n * h * w, c], vals)
+        got = device.host(runtime.maxpool2_nhwc(x, c, h, w, k, stride, pad))
+        want = _ref_maxpool_nhwc(vals, n, c, h, w, k, stride, pad)
+        assert [got[i] for i in range(len(want))] == want
+
+
+def _ref_cnn(x, wc, wf):
+    fan = CC * 9
+    feat = CO * (CH // 2) * (CW // 2)
+    inv = 1.0 / math.sqrt(1.0 + CEPS)
+    total = 0.0
+    for i in range(CN):
+        planes = []
+        for o in range(CO):
+            plane = []
+            for ph in range(CH):
+                row = []
+                for pw in range(CW):
+                    acc = 0.01
+                    for cc in range(CC):
+                        for r in range(3):
+                            for s in range(3):
+                                ih = ph + r - 1
+                                iw = pw + s - 1
+                                if 0 <= ih < CH and 0 <= iw < CW:
+                                    acc += (x[i * CC * CH * CW + cc * CH * CW +
+                                              ih * CW + iw] *
+                                            wc[(cc * 9 + r * 3 + s) * CO + o])
+                    row.append(max(acc * inv, 0.0))
+                plane.append(row)
+            planes.append(plane)
+        flat = []
+        for o in range(CO):
+            for oh in range(CH // 2):
+                for ow in range(CW // 2):
+                    p = planes[o]
+                    flat.append(max(p[2 * oh][2 * ow], p[2 * oh][2 * ow + 1],
+                                    p[2 * oh + 1][2 * ow],
+                                    p[2 * oh + 1][2 * ow + 1]))
+        for j in range(CNCLS):
+            acc = 0.01
+            for f in range(feat):
+                acc += flat[f] * wf[f * CNCLS + j]
+            total += max(acc, 0.0)
+    return total
+
+
+def _load(shape, values):
+    t = core.zeros(shape)
+    for i in range(len(values)):
+        t.host[i] = values[i]
+    return t
+
+
+def _make_cnn():
+    fan = CC * 9
+    feat = CO * (CH // 2) * (CW // 2)
+    bc = core.zeros([CO])
+    for i in range(CO):
+        bc.host[i] = 0.01
+    bf = core.zeros([CNCLS])
+    for i in range(CNCLS):
+        bf.host[i] = 0.01
+    conv = nn.Conv2d(
+        nn.Tensor(_load([fan, CO], _conv_weight(fan, CO))),
+        nn.Tensor(bc), CC, CH, CW, CO)
+    fc = nn.Linear(
+        nn.Tensor(_load([feat, CNCLS], _conv_weight(feat, CNCLS))),
+        nn.Tensor(bf))
+    return nn.CNN(conv, nn.BatchNorm2d(CO, CEPS),
+                          nn.MaxPool2d(CO, CH, CW), fc)
+
+
+class TestConv(LLJitMixin):
+
+    def setup_method(self, meth):
+        core.policy.static = True
+        core.policy.seen = []
+
+    def test_im2col_matmul_conv(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'w', 'acc'])
+        vals = _conv_input(1, 2, 4, 4)
+        wvals = _conv_weight(18, 3)
+
+        def f(n):
+            x = _load([1, 2 * 4 * 4], vals)
+            w = _load([18, 3], wvals)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, w=w, acc=acc)
+                cols = runtime.im2col(x, 2, 4, 4, 3, 1)
+                y = runtime.tensor_matmul(cols, w, 16, 3, 18, 0, 0)
+                z = runtime.col2chw(y, 1, 16, 3)
+                acc += ops.item(ops.sum(ops.mul(z, z)))
+                n -= 1
+            return acc
+        cols = _ref_im2col(vals, 1, 2, 4, 4, 3, 1)
+        expect = 0.0
+        for r in range(16):
+            for o in range(3):
+                v = 0.0
+                for k in range(18):
+                    v += cols[r * 18 + k] * wvals[k * 3 + o]
+                expect += v * v
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+        self.check_simple_loop(call_r=2, call_f=1)
+
+    def test_rowgather_matches_reference(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'idx', 'acc'])
+        vals = [float(i) for i in range(5 * 3)]
+
+        def f(n):
+            x = _load([5, 3], vals)
+            idx = _load([4], [4.0, 0.0, 2.0, 4.0])
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, idx=idx, acc=acc)
+                y = runtime.rowgather(x, idx, 4, 3)
+                acc += ops.item(ops.sum(ops.mul(y, y)))
+                n -= 1
+            return acc
+        expect = 0.0
+        for r in [4, 0, 2, 4]:
+            for c in range(3):
+                v = vals[r * 3 + c]
+                expect += v * v
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+
+    def test_maxpool2_matches_reference(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'acc'])
+        vals = _conv_input(2, 2, 4, 6)
+
+        def f(n):
+            x = _load([2, 2 * 4 * 6], vals)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, acc=acc)
+                y = runtime.maxpool2(x, 2, 4, 6)
+                acc += ops.item(ops.sum(ops.mul(y, y)))
+                n -= 1
+            return acc
+        expect = sum([v * v for v in _ref_maxpool2(vals, 2, 2, 4, 6)])
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+        self.check_simple_loop(call_r=1, call_f=1)
+
+    def test_cnn_forward_matches_reference(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'cnn', 'acc'])
+        vals = _conv_input(CN, CC, CH, CW)
+
+        def f(n):
+            x = nn.Tensor(_load([CN, CC * CH * CW], vals))
+            cnn = _make_cnn()
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, cnn=cnn, acc=acc)
+                acc += cnn.forward(x).sum().item()
+                n -= 1
+            return acc
+        expect = _ref_cnn(vals, _conv_weight(CC * 9, CO),
+                          _conv_weight(CO * (CH // 2) * (CW // 2), CNCLS))
+        res = self.meta_interp(f, [5])
+        assert abs(res - expect * 5) < 1e-9
+        self.check_simple_loop(call_r=6)
+
+    def test_cnn_backward_raises(self):
+        cnn = _make_cnn()
+        x = nn.Tensor(_load([CN, CC * CH * CW],
+                                    _conv_input(CN, CC, CH, CW)), True)
+        y = cnn.forward(x).sum()
+        import py
+        py.test.raises(ValueError, y.backward)
+
+
+TLR = 0.001
+TRAIN_CALL_R = 129
+TBLOCKS = 2
+
+
+def _tmk(shape, vals, rg):
+    t = core.zeros(shape)
+    for i in range(len(vals)):
+        t.host[i] = vals[i]
+    return nn.Tensor(t, rg)
+
+
+def _lossw(n):
+    return [(((i * 5) % 9) - 4) * 0.25 + 0.3 for i in range(n)]
+
+
+def _fd_check(f, vals, shapes, tol=1e-06, h=1e-06, stride=1):
+    ts = [_tmk(shapes[k], vals[k], True) for k in range(len(vals))]
+    loss = f(ts)
+    loss.backward()
+    for k in range(len(vals)):
+        grad = ts[k].grad
+        assert grad is not None
+        hostg = device.host(grad.t)
+        for i in range(0, len(vals[k]), stride):
+            out = []
+            for d in (h, -h):
+                pert = [list(v) for v in vals]
+                pert[k][i] += d
+                out.append(f([_tmk(shapes[j], pert[j], False)
+                              for j in range(len(pert))]).item())
+            num = (out[0] - out[1]) / (2.0 * h)
+            assert abs(num - hostg[i]) <= tol * (1.0 + abs(num))
+
+
+def _weighted_sum(y, rows, cols):
+    return y.mul(_tmk([rows, cols], _lossw(rows * cols), False),
+                 core.BC_NONE).sum()
+
+
+def test_grad_softmax_rows():
+    rows, cols = 3, 4
+    vals = [[((i * i) % 7) - 3.0 + i * 0.5 for i in range(rows * cols)]]
+    def f(ts):
+        return _weighted_sum(nn.softmax(ts[0]), rows, cols)
+    _fd_check(f, vals, [[rows, cols]])
+
+
+def test_grad_layernorm():
+    rows, cols = 3, 4
+    vals = [[((i * i) % 7) - 3.0 + i * 0.5 for i in range(rows * cols)],
+            [1.0 + i * 0.5 for i in range(cols)],
+            [i * 0.25 for i in range(cols)]]
+    def f(ts):
+        y = nn.layernorm(ts[0], ts[1], ts[2], TEPS)
+        return _weighted_sum(y, rows, cols)
+    _fd_check(f, vals, [[rows, cols], [cols], [cols]])
+
+
+def test_grad_left_broadcast():
+    rows, cols = 3, 4
+    vals = [[0.5 + i * 0.25 for i in range(cols)],
+            [1.5 + ((i * 3) % 5) for i in range(rows * cols)],
+            [2.0 + i * 0.5 for i in range(rows)]]
+    shapes = [[cols], [rows, cols], [rows, 1]]
+    def f(ts):
+        y = ts[0].sub(ts[1]).div(ts[1]).mul(ts[2], core.BC_R_COL)
+        return _weighted_sum(y, rows, cols)
+    _fd_check(f, vals, shapes)
+
+
+def test_grad_attention_head():
+    rows, d = 3, 4
+    def w(seed):
+        return [(((i * 7 + seed) % 13) - 6) * 0.125 for i in range(d * d)]
+    vals = [[((i * 3) % 5) - 2.0 + i * 0.25 for i in range(rows * d)],
+            w(0), w(1), w(2), w(3)]
+    shapes = [[rows, d], [d, d], [d, d], [d, d], [d, d]]
+    def f(ts):
+        y = nn.mha(ts[0], ts[1], ts[2], ts[3], ts[4], 1)
+        return _weighted_sum(y, rows, d)
+    _fd_check(f, vals, shapes, stride=5)
+
+
+def test_grad_transformer_block():
+    rows, d, heads = 2, 4, 2
+    def w(seed):
+        return [(((i * 7 + seed) % 13) - 6) * 0.125 for i in range(d * d)]
+    vals = [[((i * 3) % 5) - 2.0 + i * 0.25 for i in range(rows * d)],
+            w(0), w(1), w(2), w(3),
+            [1.0 + i * 0.25 for i in range(d)],
+            [i * 0.125 for i in range(d)],
+            [1.0 - i * 0.125 for i in range(d)],
+            [0.25 - i * 0.125 for i in range(d)],
+            w(5), [0.375 + i * 0.25 for i in range(d)],
+            w(9), [0.5 - i * 0.125 for i in range(d)]]
+    shapes = [[rows, d], [d, d], [d, d], [d, d], [d, d],
+              [d], [d], [d], [d], [d, d], [d], [d, d], [d]]
+    def f(ts):
+        attn = nn.MultiHead(ts[1], ts[2], ts[3], ts[4], heads)
+        layers = [nn.Linear(ts[9], ts[10]),
+                  nn.Linear(ts[11], ts[12])]
+        block = nn.TransformerBlock(attn, ts[5], ts[6], ts[7], ts[8],
+                                            nn.MLP(layers), TEPS)
+        return _weighted_sum(block.forward(ts[0]), rows, d)
+    _fd_check(f, vals, shapes, stride=5)
+
+
+def _make_transformer():
+    blocks = []
+    for i in range(TBLOCKS):
+        blocks.append(_make_block(True))
+    bias = core.zeros([TD])
+    for i in range(TD):
+        bias.host[i] = 0.01
+    head = nn.Linear(nn.Tensor(_init_weight(TD, TD)),
+                             nn.Tensor(bias))
+    return nn.Transformer(blocks, head)
+
+
+class TestTransformerTrain(LLJitMixin):
+
+    def setup_method(self, meth):
+        core.policy.static = True
+        core.policy.seen = []
+        core.policy.static_cols = True
+        core.policy.seen_cols = []
+
+    def test_transformer_train_step(self):
+        driver = JitDriver(greens=[],
+                           reds=['n', 'x', 'model', 'params', 'lr', 'acc',
+                                 'prev'])
+        def f(n):
+            x0 = core.zeros([TROWS, TD])
+            for i in range(TROWS * TD):
+                x0.host[i] = (i % 7) - 3.0
+            model = _make_transformer()
+            x = nn.Tensor(x0)
+            params = model.parameters()
+            lr = nn.Tensor(core.from_list([-TLR]))
+            acc = 0.0
+            prev = 1e30
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, model=model, params=params,
+                                       lr=lr, acc=acc, prev=prev)
+                out = model.forward(x).sum()
+                out.backward()
+                nn.sgd_step(params, lr)
+                loss = out.item()
+                if loss >= prev:
+                    return -1.0
+                prev = loss
+                acc += loss
+                n -= 1
+            return acc
+        import os
+        expect = f(5)
+        assert expect != -1.0
+        res = self.meta_interp(f, [5])
+        assert res != -1.0
+        tol = 1e-09 if 'RTENSOR_CPU' in os.environ else 1e-04
+        assert abs(res - expect) <= tol * abs(expect)
+        self.check_simple_loop(call_r=TRAIN_CALL_R)
+
+
+class TestDtypes(LLJitMixin):
+
+    def setup_method(self, meth):
+        core.policy.static = True
+        core.policy.seen = []
+        core.policy.static_cols = True
+        core.policy.seen_cols = []
+
+    def _chain(self, dt, tol):
+        driver = JitDriver(greens=[], reds=['n', 'w', 'b', 'acc'])
+        def f(n):
+            w = core.from_list([1.0, -2.0, 3.0, -4.0], dt)
+            b = core.from_list([0.5, 0.5, 0.5, 0.5], dt)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, acc=acc, w=w, b=b)
+                h = tensor_relu(tensor_add(tensor_mul(w, b, 0), b, 0))
+                acc += tensor_item(tensor_sum(h, -1))
+                n -= 1
+            return acc
+        kernels.init_dtype(dt)
+        res = self.meta_interp(f, [10])
+        assert abs(res - 30.0) <= tol * 30.0
+        self.check_simple_loop(call_r=1, call_f=1)
+
+    def test_fused_chain_float32(self):
+        self._chain(core.F32, 1e-04)
+
+    def test_fused_chain_float16(self):
+        self._chain(core.F16, 1e-02)
+
+    def _softmax(self, dt, tol):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'w', 'acc'])
+        def f(n):
+            x = core.zeros([3, 4], dt)
+            for i in range(12):
+                x.host[i] = ((i * i) % 7) - 3.0 + i * 0.5
+            w = core.zeros([4], dt)
+            for i in range(4):
+                w.host[i] = 1.0 * (1 << i)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, w=w, acc=acc)
+                s = nn.softmax(nn.Tensor(x))
+                acc += ops.item(ops.sum(ops.mul(s.t, w)))
+                n -= 1
+            return acc
+        rows = [[((i * 4 + j) * (i * 4 + j)) % 7 - 3.0 + (i * 4 + j) * 0.5
+                 for j in range(4)] for i in range(3)]
+        ref = _ref_softmax(rows)
+        expect = 0.0
+        for i in range(3):
+            for j in range(4):
+                expect += ref[i][j] * (1 << j)
+        expect *= 10
+        kernels.init_dtype(dt)
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect) <= tol * abs(expect)
+        self.check_simple_loop(call_r=1)
+
+    def test_softmax_rows_float32(self):
+        self._softmax(core.F32, 1e-04)
+
+    def test_softmax_rows_float16(self):
+        self._softmax(core.F16, 1e-02)
+
+
+def _dtype_matrix(rows, cols, seed, dt):
+    m = core.zeros([rows, cols], dt)
+    for i in range(rows * cols):
+        m.host[i] = ((i * 7 + seed) % 11 - 5) * 0.25
+    return m
+
+
+def test_matmul_float32_matches_float64():
+    kernels.init_dtype(core.F32)
+    ref = ops.matmul(_dtype_matrix(4, 5, 1, core.F64),
+                         _dtype_matrix(5, 3, 2, core.F64))
+    got = ops.matmul(_dtype_matrix(4, 5, 1, core.F32),
+                         _dtype_matrix(5, 3, 2, core.F32))
+    assert got.dtype == core.F32
+    hr = device.host(ref)
+    hg = device.host(got)
+    for i in range(12):
+        assert abs(hg[i] - hr[i]) <= 1e-04 * (abs(hr[i]) + 1.0)
+
+
+def test_matmul_bias_in_epilogue():
+    kernels.init_dtype(core.F32)
+    for rows, inner, cols in [(4, 5, 3), (70, 33, 50)]:
+        for tb in [0, 1]:
+            a = _dtype_matrix(rows, inner, 1, core.F32)
+            b = _dtype_matrix(cols if tb else inner, inner if tb else cols,
+                              2, core.F32)
+            bias = core.zeros([cols], core.F32)
+            for j in range(cols):
+                bias.host[j] = j * 0.125 - 1.0
+            ref = device.host(ops.matmul(a, b, bool(tb)))
+            got = nn.Tensor(a).matmul(nn.Tensor(b), bool(tb), 0,
+                                      nn.Tensor(bias)).t
+            assert got.dtype == core.F32
+            hg = device.host(got)
+            for i in range(rows):
+                for j in range(cols):
+                    want = ref[i * cols + j] + bias.host[j]
+                    assert abs(hg[i * cols + j] - want) <= 1e-04 * (
+                        abs(want) + 1.0)
+
+
+def test_matmul_bias_float64_adds_after():
+    kernels.init_dtype(core.F64)
+    a = _dtype_matrix(4, 5, 1, core.F64)
+    b = _dtype_matrix(5, 3, 2, core.F64)
+    bias = core.zeros([3], core.F64)
+    for j in range(3):
+        bias.host[j] = j + 0.5
+    ref = device.host(ops.matmul(a, b))
+    hg = device.host(nn.Tensor(a).matmul(nn.Tensor(b), False, 0,
+                                         nn.Tensor(bias)).t)
+    for i in range(12):
+        assert abs(hg[i] - (ref[i] + bias.host[i % 3])) <= 1e-12
+
+
+def _attn_pair(dt):
+    """Strided attention on a fused qkv buffer, the shape the models use."""
+    heads, rows, dh = 3, 4, 2
+    d = heads * dh
+    qkv = _dtype_matrix(rows, 3 * d, 3, dt)
+    f = nn.Tensor(qkv)
+    s = f.attn_scores(f, heads, rows, dh, 3 * d, 3 * d, 0, d)
+    return device.host(s.attn_context(f, heads, rows, dh, 3 * d, 2 * d).t), rows * d
+
+
+def test_attn_float32_matches_float64():
+    # float32 batched attention takes the tuned cuBLASLt path, float64 does not.
+    kernels.init_dtype(core.F32)
+    hr, n = _attn_pair(core.F64)
+    hg, _ = _attn_pair(core.F32)
+    for i in range(n):
+        assert abs(hg[i] - hr[i]) <= 1e-04 * (abs(hr[i]) + 1.0)
+
+
+def _flash_case(b, h, hk, sq, sk, d, causal, masked, prec, period=0):
+    """Queries [b, sq, h, d], keys/values [b, sk, 2, hk, d], mask [b, 1, sq, sk]: flash kernel vs explicit softmax."""
+    import random
+    rnd = random.Random(b * 1000 + sq * 10 + d)
+    kernels.init_dtype(core.F32)
+    q = core.from_list([rnd.uniform(-1, 1) for i in range(b * sq * h * d)],
+                       core.F32)
+    kv = core.from_list([rnd.uniform(-1, 1)
+                         for i in range(b * sk * 2 * hk * d)], core.F32)
+    m = core.NULLTENSOR
+    mb = period or b
+    if masked:
+        m = core.from_list([rnd.uniform(-2, 2) for i in range(mb * sq * sk)],
+                           core.F32)
+    scale = d ** -0.5
+    ld = 2 * hk * d
+    p = [b, h, hk, sq, sk, d,
+         0, sq * h * d, d, h * d,
+         0, sk * ld, d, ld,
+         hk * d, sk * ld, d, ld,
+         0, sq * sk, 0, sk, 1,
+         causal, 1, prec, period]
+    r = runtime.attention(q, kv, kv, m, p, scale)
+    if not r:
+        import py
+        py.test.skip("no CUDA device")
+    got = device.host(r)
+    hq, hkv = device.host(q), device.host(kv)
+    hm = device.host(m) if masked else None
+    worst = 0.0
+    for bi in range(b):
+        for hi in range(h):
+            g = hi // (h // hk)
+            for i in range(sq):
+                s = []
+                for j in range(sk):
+                    acc = 0.0
+                    for c in range(d):
+                        acc += (hq[((bi * sq + i) * h + hi) * d + c] *
+                                hkv[(bi * sk + j) * ld + g * d + c])
+                    acc *= scale
+                    if masked:
+                        acc += hm[((bi % mb) * sq + i) * sk + j]
+                    if causal and j > i:
+                        acc = -1e300
+                    s.append(acc)
+                top = max(s)
+                e = [math.exp(x - top) for x in s]
+                tot = sum(e)
+                for c in range(d):
+                    ref = 0.0
+                    for j in range(sk):
+                        ref += e[j] / tot * hkv[(bi * sk + j) * ld + hk * d +
+                                                g * d + c]
+                    out = got[((bi * sq + i) * h + hi) * d + c]
+                    worst = max(worst, abs(out - ref))
+    return worst
+
+
+def test_flash_attention_matches_softmax():
+    assert _flash_case(2, 4, 2, 5, 7, 16, 0, 1, 0) < 1e-5
+    assert _flash_case(1, 2, 2, 70, 70, 32, 1, 0, 3) < 1e-5
+    assert _flash_case(2, 2, 1, 3, 40, 64, 0, 0, 2) < 1e-5
+    assert _flash_case(1, 3, 1, 33, 17, 64, 0, 1, 3) < 1e-5
+    assert _flash_case(1, 2, 2, 9, 9, 128, 1, 1, 1) < 5e-3
+    assert _flash_case(6, 2, 2, 7, 7, 32, 0, 1, 3, 3) < 1e-5
+
+
+def test_row_broadcast_over_inputs_stored_with_other_rows():
+    k = kernels.build_kernel(3, [core.MUL, core.ADD], [1, 0], [2, 3],
+                             [core.BC_R_ROW, 0])
+    if k.fn == 0:
+        import py
+        py.test.skip("no CUDA device / nvcc")
+    x = core.from_list([float(i) for i in range(56)])
+    x.shape = core._shape2(2, 28)
+    y = core.from_list([1.0] * 56)
+    y.shape = core._shape2(14, 4)
+    g = core.from_list([0.5, 1.0, 2.0, 4.0])
+    r = runtime.launch_gpu(k, [x, y, g])
+    assert r
+    h = device.host(r)
+    for i in range(56):
+        assert h[i] == i + [0.5, 1.0, 2.0, 4.0][i % 4]
+
+
+def test_flash_attention_refuses_odd_head_width():
+    q = core.from_list([0.0] * 20, core.F32)
+    p = [1, 1, 1, 1, 1, 20, 0, 20, 20, 20, 0, 20, 20, 20, 0, 20, 20, 20,
+         0, 0, 0, 0, 0, 0, 1, 3, 0]
+    assert not runtime.attention(q, q, q, core.NULLTENSOR, p, 1.0)
+
+
+def test_dtype_mismatch_raises():
+    import py
+    a = core.from_list([1.0, 2.0], core.F32)
+    b = core.from_list([1.0, 2.0], core.F64)
+    py.test.raises(ValueError, ops.add, a, b)
+    py.test.raises(ValueError, ops.mul, a, b)
+    core.note_dtype(core.F64)
+
+
+def test_add_output_after_compile_keeps_the_arity_the_launcher_uses():
+    kernel = kernels.new_kernel(2, 2, core.policy.dtype)
+    kernels.set_node(kernel, 0, core.MUL, 1, 1, core.BC_NONE)
+    kernels.set_node(kernel, 1, core.DIV, 0, 2, core.BC_R_COL)
+    kernels.compile_or_reuse(kernel)
+    if kernel.fn == 0:
+        return
+    kernels.add_output(kernel, 2)
+    assert kernel.nouts == 1 + len(kernel.outputs)
+    assert not runtime.arity_mismatch(kernel)
+
+
+def _tensor_call_kinds(operations):
+    """Split a trace's calls into fused launches and single tensor ops."""
+    from rpython.jit.codewriter.effectinfo import EffectInfo
+    launches = []
+    singles = []
+    for op in operations:
+        descr = op.getdescr()
+        realref = getattr(descr, 'realdescrref', None)
+        if realref is not None:      # llgraph wraps a bridge's descrs
+            descr = realref()
+        if not hasattr(descr, 'get_extra_info'):
+            continue
+        info = descr.get_extra_info()
+        if info is None:
+            continue
+        idx = info.oopspecindex
+        if idx == EffectInfo.OS_TENSOR_LAUNCH:
+            launches.append(op)
+        elif EffectInfo.OS_TENSOR_ADD <= idx <= EffectInfo.OS_TENSOR_EQMASK:
+            singles.append(op)
+    return launches, singles
+
+
+def _loop_body(trace):
+    """The peeled body, i.e. everything from the last label on."""
+    from rpython.jit.metainterp.resoperation import rop
+    for i in range(len(trace.operations) - 1, -1, -1):
+        if trace.operations[i].getopnum() == rop.LABEL:
+            return trace.operations[i:]
+    raise AssertionError("no label in trace")
+
+
+def _bridges_of(loop):
+    """The bridges the llgraph backend attached to this trace's guards."""
+    out = []
+    for op in loop.operations:
+        descr = op.getdescr()
+        bridge = getattr(descr, '_llgraph_bridge', None)
+        if bridge is not None:
+            out.append((op, bridge))
+    return out
+
+
+class TestGuardRecovery(LLJitMixin):
+
+    def test_guard_failure_rebuilds_virtual_and_bridge_refuses(self):
+        driver = JitDriver(greens=[], reds=['n', 'k', 'w', 'b', 'acc'])
+        def f(n):
+            w = from_list([1.0, -2.0, 3.0, -4.0])
+            b = from_list([0.5, 0.25, -0.5, 2.0])
+            acc = 0.0
+            k = 1
+            while n > 0:
+                driver.jit_merge_point(n=n, k=k, acc=acc, w=w, b=b)
+                # four elementwise ops: one virtual DAG, no device memory yet
+                h = tensor_mul(w, b, 0)
+                h = tensor_add(h, b, 0)
+                h = tensor_relu(h)
+                h = tensor_mul(h, b, 0)
+                # h is still virtual here, and stays live across this guard
+                promote(k)
+                acc += tensor_item(tensor_sum(h, -1)) * k
+                n -= 1
+                if n == 30:
+                    k = 2
+            return acc
+        from rpython.jit.metainterp import resume
+        counts = {'box': 0, 'direct': 0}
+        originals = {}
+        for name, cls in (('box', resume.ResumeDataBoxReader),
+                          ('direct', resume.ResumeDataDirectReader)):
+            originals[name] = cls.tensor_op
+            def make(name, original):
+                def tensor_op(self, opcode, param, fieldnums):
+                    counts[name] += 1
+                    return original(self, opcode, param, fieldnums)
+                return tensor_op
+            cls.tensor_op = make(name, originals[name])
+        try:
+            res = self.meta_interp(f, [60])
+        finally:
+            for name, cls in (('box', resume.ResumeDataBoxReader),
+                              ('direct', resume.ResumeDataDirectReader)):
+                cls.tensor_op = originals[name]
+        from rpython.jit.metainterp.test.support import get_stats
+        stats = get_stats()
+
+        # (d) the fused result is the interpreted result
+        assert res == f(60)
+
+        loops = stats.get_all_loops()
+        assert len(loops) == 1
+        loop = loops[0]
+
+        # (a) the loop runs the whole chain as one launch
+        launches, singles = _tensor_call_kinds(_loop_body(loop))
+        assert len(launches) == 1
+        assert singles == []
+
+        # (b) the guard that keeps h virtual got a bridge compiled for it
+        assert stats.compiled_count >= 2
+        bridges = _bridges_of(loop)
+        assert len(bridges) == 1
+        guard, bridge = bridges[0]
+        assert guard.getopname() in ('guard_value', 'guard_true', 'guard_false')
+
+        # (c) the bridge re-fuses: one launch again, not one call per node
+        blaunches, bsingles = _tensor_call_kinds(_loop_body(bridge))
+        assert len(blaunches) == 1
+        assert bsingles == []
+        # and nowhere in the bridge, including its first-failure prologue, is
+        # the chain run one node at a time
+        assert _tensor_call_kinds(bridge.operations)[1] == []
+
+        # (e) both resume decoders rebuilt the chain, one call per node
+        assert counts['box'] > 0 and counts['direct'] > 0
+        assert counts['box'] == counts['direct'] == 4
+
+    def test_split_at_guard_forces_the_chain_before_it(self):
+        driver = JitDriver(greens=[], reds=['n', 'w', 'b', 'acc'])
+        def f(n):
+            w = from_list([1.0, -2.0, 3.0, -4.0])
+            b = from_list([0.5, 0.25, -0.5, 2.0])
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, acc=acc, w=w, b=b)
+                h = tensor_mul(w, b, 0)
+                h = tensor_add(h, b, 0)
+                h = tensor_relu(h)
+                h = tensor_mul(h, b, 0)
+                if n % 3 == 0:
+                    acc += 1.0
+                acc += tensor_item(tensor_sum(h, -1))
+                n -= 1
+            return acc
+        def launches_in_loop(mask):
+            core.split_knob.mask = mask
+            try:
+                res = self.meta_interp(f, [60])
+            finally:
+                core.split_knob.mask = 0
+            assert res == f(60)
+            from rpython.jit.metainterp.test.support import get_stats
+            loop = get_stats().get_all_loops()[0]
+            return len(_tensor_call_kinds(_loop_body(loop))[0])
+        assert launches_in_loop(0) == 1
+        assert launches_in_loop(core.SPLIT_BRANCH) == 2
+
+    def test_chain_forced_at_the_end_of_a_trace_is_compiled(self):
+        import py
+        if not device.gpu_enabled():
+            py.test.skip("no CUDA device")
+        from rpython.rtyper.lltypesystem import lltype
+        driver = JitDriver(greens=[], reds=['n', 'h', 'b'])
+        def f(n, h, b):
+            while n > 0:
+                driver.jit_merge_point(n=n, h=h, b=b)
+                h = tensor_mul(tensor_add(h, b, 0), b, 0)
+                n -= 1
+            return h
+        def main(m):
+            b = from_list([0.5, -0.5, 0.25])
+            acc = 0.0
+            while m > 0:
+                h = f(5, from_list([1.0, 2.0, 3.0]), b)
+                acc += tensor_item(tensor_sum(h, -1))
+                m -= 1
+            return acc
+        res = self.meta_interp(main, [20])
+        assert res == main(20)
+        from rpython.jit.metainterp.test.support import get_stats
+        traces = []
+        for loop in get_stats().get_all_loops():
+            traces.append(loop)
+            traces.extend([bridge for _, bridge in _bridges_of(loop)])
+        launched = []
+        for trace in traces:
+            launched.extend(_tensor_call_kinds(trace.operations)[0])
+        assert launched
+        for op in launched:
+            kernel = lltype.cast_opaque_ptr(core.KERNELPTR,
+                                            op.getarg(1).getref_base())
+            assert kernel.fn != 0
+
+
+def test_all_constant_chain_is_refused_past_the_launch_arity():
+    """The OptTensor cap must count folded constants when there is no tensor leaf.
+
+    force_box then recollects with folding off, making each constant a launch input."""
+    from rpython.jit.metainterp.optimizeopt.metatensor import OptTensor
+    from rpython.jit.metainterp.history import ConstPtr
+    from rpython.rtyper.lltypesystem import lltype, llmemory
+    def const(v):
+        t = from_list([v])
+        return ConstPtr(lltype.cast_opaque_ptr(llmemory.GCREF, t))
+    opt = OptTensor()
+    assert not opt._too_wide([const(0.1), const(0.2)])
+    args = [const(0.1 * (k + 1)) for k in range(core.MAX_INPUTS_LIMIT + 1)]
+    assert opt._too_wide(args)
+
+
+class TestScalarArity(LLJitMixin):
+
+    def test_scalar_chain_never_exceeds_the_launcher_arity(self):
+        driver = JitDriver(greens=[], reds=['n', 'acc'])
+        def f(n):
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, acc=acc)
+                # nine distinct cached scalars, no tensor leaf
+                h = ops.mul(runtime.scalar(0.1), runtime.scalar(0.2))
+                h = ops.add(h, runtime.scalar(0.3))
+                h = ops.mul(h, runtime.scalar(0.4))
+                h = ops.add(h, runtime.scalar(0.5))
+                h = ops.mul(h, runtime.scalar(0.6))
+                h = ops.add(h, runtime.scalar(0.7))
+                h = ops.mul(h, runtime.scalar(0.8))
+                h = ops.add(h, runtime.scalar(0.9))
+                acc += ops.item(ops.sum(h))
+                n -= 1
+            return acc
+        res = self.meta_interp(f, [10])
+        assert abs(res - f(10)) < 1e-9
+        from rpython.jit.metainterp.resoperation import rop
+        from rpython.jit.metainterp.test.support import get_stats
+        for loop in get_stats().get_all_loops():
+            for op in loop.operations:
+                if op.getopnum() == rop.CALL_R:
+                    assert op.numargs() <= 2 + core.MAX_INPUTS_LIMIT
+
+
+# every optimization except the tensor pass, as benchmark/eval's "fusion off"
+_NO_TENSOR_OPTS = 'intbounds:rewrite:virtualize:string:pure:earlyforce:heap:unroll'
+
+
+class TestInplaceHazard(LLJitMixin):
+
+    def test_deferred_read_sees_the_value_before_the_inplace_write(self):
+        driver = JitDriver(greens=[], reds=['n', 'a', 'b', 'acc'])
+        def f(n):
+            a = from_list([1.0, 1.0, 1.0, 1.0])
+            b = from_list([0.5, 0.5, 0.5, 0.5])
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, a=a, b=b, acc=acc)
+                y = ops.mul(a, b)     # deferred, still virtual
+                ops.add_(a, b)        # in-place write to y's operand
+                acc += ops.item(ops.sum(y))
+                n -= 1
+            return acc
+        assert self.meta_interp(f, [20]) == f(20)
+
+    def test_inplace_write_is_not_elided_without_the_tensor_pass(self):
+        driver = JitDriver(greens=[], reds=['n', 'a', 'b', 'acc'])
+        def f(n):
+            a = from_list([1.0, 1.0, 1.0, 1.0])
+            b = from_list([0.5, 0.5, 0.5, 0.5])
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, a=a, b=b, acc=acc)
+                ops.add_(a, b)
+                acc += ops.item(ops.sum(a))
+                n -= 1
+            return acc
+        assert self.meta_interp(f, [20], enable_opts=_NO_TENSOR_OPTS) == f(20)
+
+    def test_deferred_read_across_inplace_write_without_the_tensor_pass(self):
+        driver = JitDriver(greens=[], reds=['n', 'a', 'b', 'acc'])
+        def f(n):
+            a = from_list([1.0, 1.0, 1.0, 1.0])
+            b = from_list([0.5, 0.5, 0.5, 0.5])
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, a=a, b=b, acc=acc)
+                y = ops.mul(a, b)
+                ops.add_(a, b)
+                acc += ops.item(ops.sum(y))
+                n -= 1
+            return acc
+        assert self.meta_interp(f, [20],
+                                enable_opts=_NO_TENSOR_OPTS) == f(20)
+
+
+def test_kernel_cache_key_differs_by_compute_capability():
+    old = kernels.config.cc
+    try:
+        kernels.config.cc = '80'
+        key80 = kernels._cache_base('some ttir', 4)
+        kernels.config.cc = '86'
+        key86 = kernels._cache_base('some ttir', 4)
+        assert key80 != key86
+    finally:
+        kernels.config.cc = old
+
+
+def test_meta_with_mismatched_cc_is_not_accepted():
+    old = kernels.config.cc
+    try:
+        kernels.config.cc = '86'
+        assert kernels._meta_cc_matches('256 0 2 86\n')
+        assert not kernels._meta_cc_matches('256 0 2 80\n')
+        assert not kernels._meta_cc_matches('256 0 2\n')
+    finally:
+        kernels.config.cc = old
+
+
+def _ref_head_split(vals, rows, dh, heads):
+    out = [0.0] * (rows * dh * heads)
+    for b in range(heads):
+        for i in range(rows):
+            for j in range(dh):
+                out[(b * rows + i) * dh + j] = vals[i * heads * dh + b * dh + j]
+    return out
+
+
+class TestGatherFusion(LLJitMixin):
+
+    def setup_method(self, meth):
+        core.policy.static = True
+        core.policy.seen = []
+
+    def teardown_method(self, meth):
+        # Results would also be right from the host fallback loops, so check no compile failed.
+        import os
+        if 'RTENSOR_CPU' in os.environ:
+            return
+        for key, k in kernels.kernel_cache.kernels.items():
+            if ',11:' in key:
+                assert k.fn != 0, key
+
+    def test_rope_is_one_kernel(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'c', 's', 'w', 'acc'])
+        def f(n):
+            x = core.zeros([3, 8])
+            c = core.zeros([3, 8])
+            s = core.zeros([3, 8])
+            w = core.zeros([3, 8])
+            for i in range(24):
+                x.host[i] = (i % 5) - 2.0 + i * 0.25
+                c.host[i] = 0.5 + (i % 3) * 0.25
+                s.host[i] = (i % 4) * 0.125 - 0.2
+                w.host[i] = 1.0 + (i % 7)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, c=c, s=s, w=w, acc=acc)
+                t = nn.Tensor(x)
+                y = ops.add(ops.mul(x, c), ops.mul(t.rot_half(4).t, s))
+                acc += ops.item(ops.sum(ops.mul(y, w)))
+                n -= 1
+            return acc
+        before = set(kernels.kernel_cache.kernels)
+        xs = [(i % 5) - 2.0 + i * 0.25 for i in range(24)]
+        expect = 0.0
+        for i in range(24):
+            r = xs[i // 4 * 4 + (i % 4 + 2) % 4]
+            y = xs[i] * (0.5 + (i % 3) * 0.25) + r * ((i % 4) * 0.125 - 0.2)
+            expect += y * (1.0 + (i % 7))
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+        self.check_simple_loop(call_r=1)
+        assert len(set(kernels.kernel_cache.kernels) - before) == 1
+
+    def test_rope_without_gather_fusion(self):
+        # The ablation switch: the gather runs as its own kernel again, the
+        # arithmetic is the same.
+        core.gather_knob.off = True
+        try:
+            before = set(kernels.kernel_cache.kernels)
+            driver = JitDriver(greens=[], reds=['n', 'x', 'c', 's', 'acc'])
+            def f(n):
+                x = core.zeros([3, 8])
+                c = core.zeros([3, 8])
+                s = core.zeros([3, 8])
+                for i in range(24):
+                    x.host[i] = (i % 5) - 2.0 + i * 0.25
+                    c.host[i] = 0.5 + (i % 3) * 0.25
+                    s.host[i] = (i % 4) * 0.125 - 0.2
+                acc = 0.0
+                while n > 0:
+                    driver.jit_merge_point(n=n, x=x, c=c, s=s, acc=acc)
+                    t = nn.Tensor(x)
+                    y = ops.add(ops.mul(x, c), ops.mul(t.rot_half(4).t, s))
+                    acc += ops.item(ops.sum(y))
+                    n -= 1
+                return acc
+            xs = [(i % 5) - 2.0 + i * 0.25 for i in range(24)]
+            expect = 0.0
+            for i in range(24):
+                r = xs[i // 4 * 4 + (i % 4 + 2) % 4]
+                expect += (xs[i] * (0.5 + (i % 3) * 0.25) +
+                           r * ((i % 4) * 0.125 - 0.2))
+            res = self.meta_interp(f, [10])
+            assert abs(res - expect * 10) < 1e-9
+            added = set(kernels.kernel_cache.kernels) - before
+            assert not [k for k in added if ',11:' in k]
+        finally:
+            core.gather_knob.off = False
+
+    def test_head_split_of_a_region_is_one_kernel(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'w', 'acc'])
+        def f(n):
+            x = core.zeros([4, 6])
+            w = core.zeros([12, 2])
+            for i in range(24):
+                x.host[i] = (i % 7) - 2.5 + i * 0.1
+                w.host[i] = 1.0 + i
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, w=w, acc=acc)
+                a = nn.Tensor(ops.relu(ops.mul(x, x)))
+                b = a.head_split(4, 2, 3)
+                acc += ops.item(ops.sum(ops.mul(b.t, w)))
+                n -= 1
+            return acc
+        before = set(kernels.kernel_cache.kernels)
+        xs = [(i % 7) - 2.5 + i * 0.1 for i in range(24)]
+        blocked = _ref_head_split([v * v for v in xs], 4, 2, 3)
+        expect = sum([blocked[i] * (1.0 + i) for i in range(24)])
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+        self.check_simple_loop(call_r=1)
+        assert len(set(kernels.kernel_cache.kernels) - before) == 1
+
+    def test_fused_head_split_result_has_blocked_shape(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'm', 'acc'])
+        def f(n):
+            x = core.zeros([4, 6])
+            m = core.zeros([2, 1])
+            for i in range(24):
+                x.host[i] = (i % 7) - 2.5 + i * 0.1
+            m.host[0] = 1.0
+            m.host[1] = -2.0
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, m=m, acc=acc)
+                b = nn.Tensor(ops.relu(x)).head_split(4, 2, 3)
+                z = ops.matmul(b.t, m)
+                acc += ops.item(ops.sum(z))
+                n -= 1
+            return acc
+        xs = [max((i % 7) - 2.5 + i * 0.1, 0.0) for i in range(24)]
+        blocked = _ref_head_split(xs, 4, 2, 3)
+        expect = sum([blocked[2 * r] - 2.0 * blocked[2 * r + 1]
+                      for r in range(12)])
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+
+    def test_head_split_fuses_when_sizes_come_from_shapes(self):
+        # dh read off a shape is not a trace constant until promoted
+        driver = JitDriver(greens=[], reds=['n', 'x', 'w', 'acc'])
+        def f(n):
+            x = core.zeros([4, 6])
+            w = core.zeros([12, 2])
+            for i in range(24):
+                x.host[i] = (i % 7) - 2.5 + i * 0.1
+                w.host[i] = 1.0 + i
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, w=w, acc=acc)
+                a = nn.Tensor(ops.relu(ops.mul(x, x)))
+                heads = 3
+                dh = ops.tensor_shape(a.t, 1) // heads
+                b = a.head_split(4, dh, heads)
+                acc += ops.item(ops.sum(ops.mul(b.t, w)))
+                n -= 1
+            return acc
+        xs = [(i % 7) - 2.5 + i * 0.1 for i in range(24)]
+        blocked = _ref_head_split([v * v for v in xs], 4, 2, 3)
+        expect = sum([blocked[i] * (1.0 + i) for i in range(24)])
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+        self.check_simple_loop(call_r=1)
+
+    def test_values_of_a_gathered_kernel_become_extra_outputs(self):
+        # a sits under the gather and b is the gather; both are needed after
+        # the kernel that computed them has run.
+        driver = JitDriver(greens=[], reds=['n', 'x', 'w', 'm', 'acc'])
+        def f(n):
+            x = core.zeros([4, 6])
+            w = core.zeros([12, 2])
+            m = core.zeros([2, 1])
+            for i in range(24):
+                x.host[i] = (i % 7) - 2.5 + i * 0.1
+                w.host[i] = 1.0 + i
+            m.host[0] = 1.0
+            m.host[1] = -2.0
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, w=w, m=m, acc=acc)
+                a = nn.Tensor(ops.relu(ops.mul(x, x)))
+                b = a.head_split(4, 2, 3)
+                acc += ops.item(ops.sum(ops.mul(b.t, w)))
+                acc += 100.0 * ops.item(ops.sum(ops.mul(a.t, x)))
+                acc += 1000.0 * ops.item(ops.sum(ops.matmul(b.t, m)))
+                n -= 1
+            return acc
+        xs = [(i % 7) - 2.5 + i * 0.1 for i in range(24)]
+        sq = [v * v for v in xs]
+        blocked = _ref_head_split(sq, 4, 2, 3)
+        expect = (sum([blocked[i] * (1.0 + i) for i in range(24)]) +
+                  100.0 * sum([sq[i] * xs[i] for i in range(24)]) +
+                  1000.0 * sum([blocked[2 * r] - 2.0 * blocked[2 * r + 1]
+                                for r in range(12)]))
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-6
+        assert any(',o' in k and ',11:' in k
+                   for k in kernels.kernel_cache.kernels)
+
+    def test_eager_gather_matches_host_loops(self):
+        x = core.zeros([4, 6])
+        for i in range(24):
+            x.host[i] = i * 1.0
+        y = ops.gather(x, core.GA_HEADSPLIT, 2, 3)
+        assert [y.shape[0], y.shape[1]] == [12, 2]
+        assert list(device.host(y))[:24] == _ref_head_split(
+            [i * 1.0 for i in range(24)], 4, 2, 3)
+        z = ops.gather(y, core.GA_HEADMERGE, 2, 3)
+        assert [z.shape[0], z.shape[1]] == [4, 6]
+        assert list(device.host(z))[:24] == [i * 1.0 for i in range(24)]
+
+
+def _ref_unary(fn, v):
+    if fn == core.U_TANH:
+        return math.tanh(v)
+    if fn == core.U_SIGMOID:
+        return 1.0 / (1.0 + math.exp(-v))
+    if fn == core.U_LOG:
+        if v < 0.0:
+            return float('nan')
+        return math.log(v) if v > 0.0 else float('-inf')
+    if fn == core.U_ABS:
+        return abs(v)
+    if fn == core.U_SIN:
+        return math.sin(v)
+    if fn == core.U_COS:
+        return math.cos(v)
+    if fn == core.U_ERF:
+        return math.erf(v)
+    if fn == core.U_FLOOR:
+        return math.floor(v)
+    if fn == core.U_GELU:
+        return 0.5 * v * (1.0 + math.erf(v / math.sqrt(2.0)))
+    if fn == core.U_SILU:
+        return v / (1.0 + math.exp(-v))
+    return -v
+
+
+def _ref_binary(fn, x, y):
+    if fn == core.B_MAX:
+        return max(x, y)
+    if fn == core.B_MIN:
+        return min(x, y)
+    if fn == core.B_POW:
+        if x < 0.0 and y != math.floor(y):
+            return float('nan')
+        return math.pow(x, y)
+    if fn == core.B_KEEP_NZ:
+        return y if x != 0.0 else 0.0
+    if fn == core.B_KEEP_Z:
+        return y if x == 0.0 else 0.0
+    t = [x < y, x <= y, x > y, x >= y, x == y, x != y][fn - core.B_LT]
+    return 1.0 if t else 0.0
+
+
+def _close(got, want, tol):
+    if want != want:
+        return got != got
+    if abs(want) == float('inf'):
+        return got == want
+    return abs(got - want) <= tol * max(1.0, abs(want))
+
+
+_EW_TOL = {core.F64: 1e-13, core.F32: 2e-06, core.F16: 2e-03}
+
+
+class TestElementwiseMath(object):
+
+    def teardown_method(self, meth):
+        core.note_dtype(core.F64)
+
+    def _gpu_used(self, opcode, p, dt):
+        import os
+        if 'RTENSOR_CPU' not in os.environ:
+            assert kernels.single_kernel(opcode, p, dt).fn != 0
+
+    def test_unary_matches_math(self):
+        xs = [-3.0, -0.5, -0.0, 0.0, 0.25, 1.0, 2.5, 7.75]
+        for dt in [core.F64, core.F32, core.F16]:
+            kernels.init_dtype(dt)
+            x = from_list(xs, dt)
+            for fn in range(len(core.UNARY_NAMES)):
+                y = device.host(ops.unary(x, fn))
+                for i in range(len(xs)):
+                    want = _ref_unary(fn, xs[i])
+                    assert _close(y[i], want, _EW_TOL[dt]), (
+                        core.UNARY_NAMES[fn], dt, xs[i], y[i], want)
+                self._gpu_used(core.UNARY, fn, dt)
+
+    def test_binary_matches_math(self):
+        xs = [-2.0, -0.5, 0.0, 0.5, 1.0, 3.0]
+        ys = [3.0, -0.5, 1.0, 0.5, -2.0, 2.0]
+        for dt in [core.F64, core.F32]:
+            kernels.init_dtype(dt)
+            x = from_list(xs, dt)
+            y = from_list(ys, dt)
+            for fn in range(len(core.BINARY_NAMES)):
+                if fn == core.B_POW:
+                    continue
+                r = device.host(ops.binary(x, y, fn))
+                for i in range(len(xs)):
+                    want = _ref_binary(fn, xs[i], ys[i])
+                    assert _close(r[i], want, _EW_TOL[dt]), (
+                        core.BINARY_NAMES[fn], dt, xs[i], ys[i], r[i])
+                self._gpu_used(core.BINARY, core.NPARAMS * fn, dt)
+
+    def test_pow_tensor_and_scalar_exponents(self):
+        xs = [0.5, 1.0, 2.0, 3.5, 9.0, -2.0]
+        es = [2.0, 0.5, -1.0, 3.0, 0.5, 3.0]
+        for dt in [core.F64, core.F32]:
+            kernels.init_dtype(dt)
+            x = from_list(xs, dt)
+            r = device.host(ops.binary(x, from_list(es, dt), core.B_POW))
+            for i in range(len(xs)):
+                assert _close(r[i], math.pow(xs[i], es[i]), _EW_TOL[dt])
+            for e in [2.0, -0.5]:
+                r = device.host(ops.binary(x, runtime.scalar_of(e, dt),
+                                           core.B_POW))
+                for i in range(len(xs)):
+                    assert _close(r[i], _ref_binary(core.B_POW, xs[i], e),
+                                  _EW_TOL[dt])
+            self._gpu_used(core.BINARY, core.BC_R_SCALAR +
+                           core.NPARAMS * core.B_POW, dt)
+            # base on the left: 2 ** x
+            r = device.host(ops.binary(runtime.scalar_of(2.0, dt), x,
+                                       core.B_POW))
+            for i in range(len(xs)):
+                assert _close(r[i], math.pow(2.0, xs[i]), _EW_TOL[dt])
+
+    def test_binary_broadcast_row_and_column(self):
+        m = core.zeros([2, 3])
+        for i in range(6):
+            m.host[i] = i - 2.0
+        row = from_list([0.0, 1.0, -1.0])
+        col = core.column(2)
+        col.host[0] = 0.5
+        col.host[1] = -0.5
+        r = device.host(ops.binary(m, row, core.B_GT))
+        assert list(r)[:6] == [0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+        r = device.host(ops.binary(row, m, core.B_MAX))
+        assert list(r)[:6] == [0.0, 1.0, 0.0, 1.0, 2.0, 3.0]
+        r = device.host(ops.binary(m, col, core.B_MIN))
+        assert list(r)[:6] == [-2.0, -1.0, 0.0, -0.5, -0.5, -0.5]
+
+    def test_where_is_a_select(self):
+        inf = float('inf')
+        nan = float('nan')
+        c = from_list([1.0, 0.0, 1.0, 0.0, -2.0])
+        a = from_list([1.0, inf, 2.0, nan, 3.0])
+        b = from_list([nan, 4.0, -inf, 5.0, inf])
+        r = device.host(ops.where(c, a, b))
+        assert list(r)[:5] == [1.0, 4.0, 2.0, 5.0, 3.0]
+        r = device.host(ops.where(c, a, runtime.scalar_of(-1.0, core.F64)))
+        assert list(r)[:5] == [1.0, -1.0, 2.0, -1.0, 3.0]
+
+    def test_cpu_matches_host_reference(self):
+        # the loops a failed launch falls back to
+        xs = [-3.0, -0.5, 0.0, 0.25, 1.0, 2.5]
+        x = from_list(xs)
+        for fn in range(len(core.UNARY_NAMES)):
+            y = device.host(runtime.eval_op_cpu(core.UNARY, x, core.NULLTENSOR,
+                                                fn))
+            for i in range(len(xs)):
+                assert _close(y[i], _ref_unary(fn, xs[i]), 1e-15)
+        y = from_list([1.0, 0.5, 2.0, -1.0, 2.0, 0.0])
+        for fn in range(len(core.BINARY_NAMES)):
+            r = device.host(runtime.eval_op_cpu(core.BINARY, x, y,
+                                                core.NPARAMS * fn))
+            for i in range(len(xs)):
+                assert _close(r[i], _ref_binary(fn, xs[i], y.host[i]), 1e-15)
+
+
+class TestElementwiseFusion(LLJitMixin):
+
+    def setup_method(self, meth):
+        core.policy.static = True
+        core.policy.seen = []
+
+    def teardown_method(self, meth):
+        import os
+        if 'RTENSOR_CPU' in os.environ:
+            return
+        for key, k in kernels.kernel_cache.kernels.items():
+            if ',12:' in key or ',13:' in key:
+                assert k.fn != 0, key
+
+    def test_tanh_sigmoid_chain_is_one_kernel(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'a', 'acc'])
+        xs = [-2.0, -0.5, 0.0, 0.75, 1.5, 3.0]
+        def f(n):
+            x = from_list(xs)
+            a = from_list([0.5, 1.0, 2.0, -1.0, 0.25, 1.0])
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, a=a, acc=acc)
+                y = ops.add(ops.unary(ops.mul(x, a), core.U_TANH),
+                            ops.unary(x, core.U_SIGMOID))
+                acc += ops.item(ops.sum(y))
+                n -= 1
+            return acc
+        av = [0.5, 1.0, 2.0, -1.0, 0.25, 1.0]
+        expect = sum([math.tanh(xs[i] * av[i]) + 1.0 / (1.0 + math.exp(-xs[i]))
+                      for i in range(6)])
+        before = set(kernels.kernel_cache.kernels)
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+        self.check_simple_loop(call_r=1)
+        assert len(set(kernels.kernel_cache.kernels) - before) == 1
+
+    def test_where_compare_pow_is_one_kernel(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'acc'])
+        xs = [-2.0, -0.5, 0.0, 0.75, 1.5, 3.0]
+        def f(n):
+            x = from_list(xs)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, acc=acc)
+                m = ops.binary(x, runtime.scalar(0.0), core.B_GT)
+                sq = ops.binary(x, runtime.scalar(2.0), core.B_POW)
+                y = ops.where(m, sq, ops.unary(x, core.U_ABS))
+                acc += ops.item(ops.sum(ops.binary(y, x, core.B_MAX)))
+                n -= 1
+            return acc
+        expect = sum([max(v * v if v > 0.0 else abs(v), v) for v in xs])
+        before = set(kernels.kernel_cache.kernels)
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+        self.check_simple_loop(call_r=1)
+        assert len(set(kernels.kernel_cache.kernels) - before) == 1
+
+
+def _mk_kernel(ninputs, nodes, dt, n, cols, consts=(), outputs=()):
+    from rpython.rtyper.lltypesystem import lltype
+    k = kernels.new_kernel(ninputs, len(nodes), dt)
+    for i, (op, a, b, p) in enumerate(nodes):
+        kernels.set_node(k, i, op, a, b, p)
+    k.n = n
+    k.cols = cols
+    if consts:
+        k.consts = lltype.malloc(core.HOSTARRAY, len(consts))
+        for i, c in enumerate(consts):
+            k.consts[i] = c
+    if outputs:
+        k.outputs = lltype.malloc(core.SHAPEARRAY, len(outputs))
+        for i, o in enumerate(outputs):
+            k.outputs[i] = o
+    return k
+
+
+def _row_chains():
+    S, M, B = core.SUM, core.MAXR, core.BINARY
+    softmax = (1, [(M, 0, -1, 1), (core.SUB, 0, 1, core.BC_R_COL),
+                   (core.EXP, 2, -1, 0), (S, 3, -1, 1),
+                   (core.DIV, 3, 4, core.BC_R_COL)], (), ())
+    logsoftmax = (1, [(M, 0, -1, 1), (core.SUB, 0, 1, core.BC_R_COL),
+                      (core.EXP, 2, -1, 0), (S, 3, -1, 1),
+                      (core.UNARY, 4, -1, core.U_LOG),
+                      (core.SUB, 2, 5, core.BC_R_COL)], (), ())
+    layernorm = (3, [(S, 0, -1, 1), (core.MUL, 5, 3, core.BC_R_SCALAR),
+                     (core.SUB, 0, 6, core.BC_R_COL), (core.MUL, 7, 7, 0),
+                     (S, 8, -1, 1), (core.MUL, 9, 3, core.BC_R_SCALAR),
+                     (core.ADD, 10, 4, core.BC_R_SCALAR), (core.SQRT, 11, -1, 0),
+                     (core.DIV, 7, 12, core.BC_R_COL),
+                     (core.MUL, 13, 1, core.BC_R_ROW),
+                     (core.ADD, 14, 2, core.BC_R_ROW)], (1e-3, 1e-5), ())
+    rowsum_out = (2, [(core.MUL, 0, 1, core.BC_R_ROW),
+                      (B, 2, 0, core.NPARAMS * core.B_MAX), (S, 3, -1, 1)],
+                  (), (2,))
+    gelu_sum = (1, [(core.UNARY, 0, -1, core.U_TANH), (core.MUL, 1, 0, 0),
+                    (S, 2, -1, core.AXIS_ALL)], (), (1,))
+    return [softmax, logsoftmax, layernorm, rowsum_out, gelu_sum]
+
+
+def _ttir_cases_rows():
+    for dt in range(3):
+        for n, cols in [(0, 0), (8192, 64), (100, 10), (0, 64), (0, 3000),
+                        (65536, 30522), (0, 9000)]:
+            for ninputs, nodes, consts, outputs in _row_chains():
+                yield _mk_kernel(ninputs, nodes, dt, n, cols, consts,
+                                 outputs)
+            for fn in range(len(core.UNARY_NAMES)):
+                yield _mk_kernel(1, [(core.UNARY, 0, -1, fn),
+                                     (core.MAXR, 1, -1, 1)], dt, n, cols)
+            for fn in range(len(core.BINARY_NAMES)):
+                for bc in range(core.NPARAMS):
+                    yield _mk_kernel(2, [(core.BINARY, 0, 1,
+                                          bc + core.NPARAMS * fn),
+                                         (core.SUM, 2, -1, 1)], dt, n, cols)
+
+
+def _ttir_cases():
+    from rpython.rtyper.lltypesystem import lltype
+    nold = core.GATHER + 1
+    gparams = [core.gather_param(core.GA_ROTHALF, 4, 1),
+               core.gather_param(core.GA_HEADSPLIT, 2, 3),
+               core.gather_param(core.GA_HEADMERGE, 2, 3)]
+    def params_of(op):
+        if core.is_reduction(op):
+            return [-1, 0, 1]
+        if op == core.GATHER:
+            return gparams
+        if core.ARITY[op] == 2:
+            return range(core.NPARAMS)
+        return [0]
+    def mk(ninputs, nodes, dt, n, cols, consts=(), outputs=()):
+        k = kernels.new_kernel(ninputs, len(nodes), dt)
+        for i, (op, a, b, p) in enumerate(nodes):
+            kernels.set_node(k, i, op, a, b, p)
+        k.n = n
+        k.cols = cols
+        if consts:
+            k.consts = lltype.malloc(core.HOSTARRAY, len(consts))
+            for i, c in enumerate(consts):
+                k.consts[i] = c
+        if outputs:
+            k.outputs = lltype.malloc(core.SHAPEARRAY, len(outputs))
+            for i, o in enumerate(outputs):
+                k.outputs[i] = o
+        return k
+    elem = [o for o in range(nold)
+            if not core.is_reduction(o) and o != core.GATHER]
+    for dt in range(3):
+        for n, cols in [(0, 0), (8192, 64), (100, 10), (0, 64)]:
+            for op in range(nold):
+                for p in params_of(op):
+                    b = 1 if core.ARITY[op] == 2 else -1
+                    yield mk(core.ARITY[op], [(op, 0, b, p)], dt, n, cols)
+            for op1 in elem:
+                for p1 in params_of(op1):
+                    b1 = 1 if core.ARITY[op1] == 2 else -1
+                    for op2 in range(nold):
+                        for p2 in params_of(op2):
+                            b2 = 2 if core.ARITY[op2] == 2 else -1
+                            yield mk(3, [(op1, 0, b1, p1), (op2, 3, b2, p2)],
+                                     dt, n, cols)
+            for op in elem:
+                for p in params_of(op):
+                    b = 1 if core.ARITY[op] == 2 else -1
+                    yield mk(2, [(op, 0, b, p), (core.MUL, 3, 2, 0),
+                                 (core.SUM, 4, -1, 1)], dt, n, cols,
+                             consts=[0.5])
+                    yield mk(2, [(op, 0, b, p), (core.ADD, 3, 1, 0)], dt, n,
+                             cols, consts=[1e-5], outputs=[3])
+
+
+def test_ttir_of_existing_opcodes_is_unchanged():
+    # Digest of the TTIR for 30,888 kernels over the opcodes predating UNARY and
+    # BINARY, so cached cubins and earlier measurements stay valid.
+    import hashlib
+    from rpython.metatensor import ttir
+    h = hashlib.sha1()
+    count = 0
+    spread = core.config.spread
+    core.config.spread = False
+    try:
+        for k in _ttir_cases():
+            src = ttir.to_ttir(k, 'kname')
+            h.update('%s\t%s\n' % (kernels.kernel_key(k),
+                                   hashlib.sha1(src).hexdigest()))
+            count += 1
+    finally:
+        core.config.spread = spread
+    assert count == 30888
+    assert h.hexdigest() == '7efc9909c53837e8f297e158e0e2a0e46e456df9'
+
+
+def test_small_flat_launches_are_spread_over_more_programs():
+    from rpython.metatensor import ttir
+    k = kernels.new_kernel(2, 1, core.F32)
+    kernels.set_node(k, 0, core.ADD, 0, 1, 0)
+    k.vroot = -1
+    k.sumroot = 0
+    flat = core.config.flat
+    for n, want in [(40000, 256), (200000, 1024), (1 << 20, flat), (0, flat)]:
+        k.n = n
+        assert ttir.flat_block(k) == min(want, flat)
+    k.n = 40000
+    spread = core.config.spread
+    core.config.spread = False
+    try:
+        assert ttir.flat_block(k) == flat
+    finally:
+        core.config.spread = spread
+
+
+def _on_gpu(before):
+    import os
+    if 'RTENSOR_CPU' not in os.environ:
+        assert device.fallbacks.n == before
+
+
+def _vals(n, seed=1):
+    return [float((i * 7 + seed * 3) % 23 - 11) * 0.5 for i in range(n)]
+
+
+def _from(vals, shape, dt):
+    t = from_list(vals, dt)
+    if len(shape) > 1:
+        t = ops.reshape(t, shape)
+    return t
+
+
+_DM_TOL = {core.F64: 1e-12, core.F32: 1e-05, core.F16: 5e-03}
+
+
+def _prod(xs):
+    n = 1
+    for x in xs:
+        n *= x
+    return n
+
+
+def _coords(i, shape):
+    xs = []
+    for d in reversed(shape):
+        xs.append(i % d)
+        i //= d
+    return xs[::-1]
+
+
+def _ref_conv(x, wt, bias, n, c, h, w, o, g, kh, kw, sh, sw, ph, pw, dh, dw):
+    oh = (h + 2 * ph - dh * (kh - 1) - 1) // sh + 1
+    ow = (w + 2 * pw - dw * (kw - 1) - 1) // sw + 1
+    cg = c // g
+    og = o // g
+    out = []
+    for b in range(n):
+        for oc in range(o):
+            gi = oc // og
+            for y in range(oh):
+                for z in range(ow):
+                    acc = bias[oc] if bias else 0.0
+                    for ci in range(cg):
+                        for a in range(kh):
+                            for e in range(kw):
+                                ih = y * sh - ph + a * dh
+                                iw = z * sw - pw + e * dw
+                                if 0 <= ih < h and 0 <= iw < w:
+                                    ch = gi * cg + ci
+                                    wv = wt[((gi * cg + ci) * kh * kw +
+                                             a * kw + e) * og + oc % og]
+                                    acc += x[((b * c + ch) * h + ih) * w +
+                                             iw] * wv
+                    out.append(acc)
+    return out
+
+
+class TestDataMovement(object):
+
+    def teardown_method(self, meth):
+        core.note_dtype(core.F64)
+
+    def _check(self, got, want, dt):
+        got = list(device.host(got))[:len(want)]
+        assert len(got) == len(want)
+        for i in range(len(want)):
+            assert _close(got[i], want[i], _DM_TOL[dt]), (i, got[i], want[i])
+
+    def test_strided_copy(self):
+        cases = [([2, 3, 4], [12, 4, 1], 0, [4, 2, 3], [1, 12, 4], 0),
+                 ([2, 3, 4], [12, 4, 1], 0, [2, 4], [12, 1], 4),
+                 ([6, 5], [5, 1], 0, [3, 5], [10, 1], 0),
+                 ([6, 5], [5, 1], 0, [6], [5], 3),
+                 ([6, 5], [5, 1], 0, [6, 5], [-5, 1], 25),
+                 ([3, 4], [4, 1], 0, [2, 3, 4], [0, 4, 1], 0),
+                 ([3, 4], [4, 1], 0, [3, 2, 4, 1], [4, 0, 1, 0], 0),
+                 ([2, 1, 3, 1, 2, 2], None, 0, [2, 2, 2, 1, 3, 1],
+                  [1, 2, 6, 1, 2, 1], 0)]
+        for dt in [core.F64, core.F32, core.F16]:
+            kernels.init_dtype(dt)
+            for src_shape, _, _, shape, strides, off in cases:
+                vals = _vals(_prod(src_shape))
+                x = _from(vals, src_shape, dt)
+                want = []
+                for i in range(_prod(shape)):
+                    xs = _coords(i, shape)
+                    want.append(vals[off + sum([a * b for a, b in
+                                                zip(xs, strides)])])
+                before = device.fallbacks.n
+                y = runtime.strided(x, shape, strides, off)
+                assert [y.shape[j] for j in range(len(shape))] == shape
+                self._check(y, want, dt)
+                _on_gpu(before)
+
+    def test_cat(self):
+        for dt in [core.F64, core.F32, core.F16]:
+            kernels.init_dtype(dt)
+            for outer, widths in [(1, [3, 5]), (2, [3, 1, 4]), (3, [2] * 11),
+                                  (4, [5])]:
+                parts = [_vals(outer * wk, seed=k)
+                         for k, wk in enumerate(widths)]
+                ts = [_from(p, [outer, len(p) // outer], dt) for p in parts]
+                want = []
+                for o in range(outer):
+                    for k, wk in enumerate(widths):
+                        want.extend(parts[k][o * wk:(o + 1) * wk])
+                before = device.fallbacks.n
+                y = runtime.cat(ts, outer)
+                assert [y.shape[0], y.shape[1]] == [outer, sum(widths)]
+                self._check(y, want, dt)
+                _on_gpu(before)
+
+    def test_pad(self):
+        cases = [([2, 3], [1, 2, 0, 1], 0.0),
+                 ([2, 3, 4], [0, 0, 1, 1, 2, 0], -1.5),
+                 ([4, 5], [-1, 1, 2, -2], 2.0),
+                 ([2, 2, 3, 3], [0, 0, 0, 0, 1, 1, 1, 1], float('-inf'))]
+        for dt in [core.F64, core.F32, core.F16]:
+            kernels.init_dtype(dt)
+            for shape, pads, value in cases:
+                vals = _vals(_prod(shape))
+                x = _from(vals, shape, dt)
+                oshape = [shape[j] + pads[2 * j] + pads[2 * j + 1]
+                          for j in range(len(shape))]
+                want = []
+                for i in range(_prod(oshape)):
+                    xs = [a - pads[2 * j] for j, a in
+                          enumerate(_coords(i, oshape))]
+                    if all([0 <= xs[j] < shape[j] for j in range(len(xs))]):
+                        k = 0
+                        for j in range(len(xs)):
+                            k = k * shape[j] + xs[j]
+                        want.append(vals[k])
+                    else:
+                        want.append(value)
+                before = device.fallbacks.n
+                self._check(runtime.pad(x, shape, pads, value), want, dt)
+                _on_gpu(before)
+
+    def test_place(self):
+        cases = [([4, 5], [1, 2], [2, 3]),
+                 ([3, 4, 5], [0, 1, 4], [3, 2, 1]),
+                 ([2, 3, 4, 2, 2], [0, 1, 1, 1, 0], [2, 1, 3, 1, 1]),
+                 ([6], [0], [6])]
+        for dt in [core.F64, core.F32, core.F16]:
+            kernels.init_dtype(dt)
+            for shape, starts, sizes in cases:
+                vals = _vals(_prod(shape))
+                box = _vals(_prod(sizes), seed=3)
+                x = _from(vals, shape, dt)
+                src = _from(box, sizes, dt)
+                want = []
+                for i in range(_prod(shape)):
+                    xs = _coords(i, shape)
+                    bs = [xs[j] - starts[j] for j in range(len(xs))]
+                    if all([0 <= bs[j] < sizes[j] for j in range(len(bs))]):
+                        k = 0
+                        for j in range(len(bs)):
+                            k = k * sizes[j] + bs[j]
+                        want.append(box[k])
+                    else:
+                        want.append(vals[i])
+                before = device.fallbacks.n
+                y = runtime.place(x, src, shape, starts, sizes)
+                assert [y.shape[j] for j in range(len(shape))] == shape
+                self._check(y, want, dt)
+                _on_gpu(before)
+
+    def test_device_zeros(self):
+        for dt in [core.F64, core.F32]:
+            kernels.init_dtype(dt)
+            before = device.fallbacks.n
+            y = runtime.device_zeros([3, 7], dt)
+            assert [y.shape[0], y.shape[1]] == [3, 7]
+            self._check(y, [0.0] * 21, dt)
+            _on_gpu(before)
+
+    def test_row_broadcast_of_3d(self):
+        for dt in [core.F64, core.F32]:
+            kernels.init_dtype(dt)
+            vals = _vals(2 * 3 * 4)
+            row = _vals(4, seed=5)
+            x = _from(vals, [2, 3, 4], dt)
+            r = _from(row, [1, 1, 4], dt)
+            before = device.fallbacks.n
+            y = ops.mul(x, r)
+            want = [vals[i] * row[i % 4] for i in range(24)]
+            self._check(y, want, dt)
+            _on_gpu(before)
+
+    def test_gather_and_index_select(self):
+        for dt in [core.F64, core.F32, core.F16]:
+            kernels.init_dtype(dt)
+            vals = _vals(4 * 5)
+            x = _from(vals, [4, 5], dt)
+            idx = from_list([4.0, 0.0, 2.0, 3.0], dt)
+            before = device.fallbacks.n
+            y = runtime.take(x, idx, 4, 1, 1, 1, 1, 1)
+            self._check(y, [vals[r * 5 + [4, 0, 2, 3][r]] for r in range(4)],
+                        dt)
+            outer, d, inner = 2, 3, 4
+            vals = _vals(outer * d * inner)
+            x = _from(vals, [outer * d, inner], dt)
+            sel = [2.0, 0.0, 2.0, 1.0, 7.0]
+            y = runtime.take(x, from_list(sel, dt), outer, 5, inner, 0, 1, 0)
+            want = []
+            for o in range(outer):
+                for s in sel:
+                    for i in range(inner):
+                        want.append(vals[(o * d + int(s)) * inner + i]
+                                    if s < d else 0.0)
+            self._check(y, want, dt)
+            gi = [float((q * 5) % d) for q in range(outer * 2 * inner)]
+            y = runtime.take(x, from_list(gi, dt), outer, 2, inner, 2 * inner,
+                             inner, 1)
+            want = [vals[(q // (2 * inner) * d + int(gi[q])) * inner +
+                         q % inner] for q in range(len(gi))]
+            self._check(y, want, dt)
+            _on_gpu(before)
+
+    def test_avg_pool2d(self):
+        cases = [(1, 2, 5, 5, 2, 2, 2, 2, 0, 0, True, False),
+                 (2, 3, 7, 6, 3, 3, 2, 2, 1, 1, True, False),
+                 (2, 3, 7, 6, 3, 3, 2, 2, 1, 1, False, False),
+                 (1, 2, 6, 7, 3, 2, 2, 1, 1, 0, False, True),
+                 (1, 1, 5, 5, 2, 2, 2, 2, 0, 0, True, True)]
+        for dt in [core.F64, core.F32, core.F16]:
+            kernels.init_dtype(dt)
+            for n, c, h, w, kh, kw, sh, sw, ph, pw, incl, ceil in cases:
+                vals = _vals(n * c * h * w)
+                x = _from(vals, [n, c * h * w], dt)
+                oh = runtime.pool_out(h, kh, sh, ph, ceil)
+                ow = runtime.pool_out(w, kw, sw, pw, ceil)
+                want = []
+                for p in range(n * c):
+                    for y in range(oh):
+                        for z in range(ow):
+                            hs, ws = y * sh - ph, z * sw - pw
+                            he, we = min(hs + kh, h + ph), min(ws + kw, w + pw)
+                            cnt = (he - hs) * (we - ws)
+                            if not incl:
+                                cnt = ((min(he, h) - max(hs, 0)) *
+                                       (min(we, w) - max(ws, 0)))
+                            acc = 0.0
+                            for a in range(max(hs, 0), min(he, h)):
+                                for b in range(max(ws, 0), min(we, w)):
+                                    acc += vals[(p * h + a) * w + b]
+                            want.append(acc / cnt)
+                before = device.fallbacks.n
+                r = runtime.avg_pool2d(x, c, h, w, kh, kw, sh, sw, ph, pw,
+                                       incl, ceil)
+                assert [r.shape[0], r.shape[1]] == [n, c * oh * ow]
+                self._check(r, want, dt)
+                _on_gpu(before)
+
+    def test_adaptive_avg_pool2d(self):
+        for dt in [core.F64, core.F32, core.F16]:
+            kernels.init_dtype(dt)
+            for n, c, h, w, oh, ow in [(2, 3, 7, 7, 1, 1), (1, 2, 10, 9, 3, 4),
+                                       (1, 1, 5, 6, 7, 6)]:
+                vals = _vals(n * c * h * w)
+                x = _from(vals, [n, c * h * w], dt)
+                want = []
+                for p in range(n * c):
+                    for y in range(oh):
+                        for z in range(ow):
+                            hs = y * h // oh
+                            he = -(-(y + 1) * h // oh)
+                            ws = z * w // ow
+                            we = -(-(z + 1) * w // ow)
+                            acc = 0.0
+                            for a in range(hs, he):
+                                for b in range(ws, we):
+                                    acc += vals[(p * h + a) * w + b]
+                            want.append(acc / ((he - hs) * (we - ws)))
+                before = device.fallbacks.n
+                self._check(runtime.adaptive_avg_pool2d(x, c, h, w, oh, ow),
+                            want, dt)
+                _on_gpu(before)
+
+    def test_im2col2_matches_direct_convolution(self):
+        for dt in [core.F64, core.F32]:
+            kernels.init_dtype(dt)
+            for (n, c, h, w, o, kh, kw, sh, sw, ph, pw, dh, dw) in [
+                    (2, 3, 6, 7, 4, 3, 1, 1, 2, 1, 0, 1, 1),
+                    (1, 2, 1, 9, 3, 1, 3, 1, 1, 0, 1, 1, 2),
+                    (1, 2, 7, 7, 2, 3, 3, 2, 2, 2, 2, 2, 2)]:
+                vals = _vals(n * c * h * w)
+                wv = _vals(c * kh * kw * o, seed=5)
+                x = _from(vals, [n, c * h * w], dt)
+                wt = _from(wv, [c * kh * kw, o], dt)
+                oh = (h + 2 * ph - dh * (kh - 1) - 1) // sh + 1
+                ow = (w + 2 * pw - dw * (kw - 1) - 1) // sw + 1
+                before = device.fallbacks.n
+                cols = runtime.im2col2(x, c, h, w, kh, kw, sh, sw, ph, pw, dh,
+                                       dw)
+                y = runtime.tensor_matmul(cols, wt, n * oh * ow, o,
+                                          c * kh * kw, 0, 0)
+                y = runtime.col2chw(y, n, oh * ow, o)
+                self._check(y, _ref_conv(vals, wv, None, n, c, h, w, o, 1, kh,
+                                         kw, sh, sw, ph, pw, dh, dw), dt)
+                _on_gpu(before)
+
+    def test_conv_matches_direct_convolution(self):
+        def nhwc(v, n, c, hw):
+            return [v[(i // (hw * c) * c + i % c) * hw + i // c % hw]
+                    for i in range(n * c * hw)]
+        dt = core.F32
+        kernels.init_dtype(dt)
+        for (n, c, h, w, o, kh, kw, sh, sw, ph, pw, dh, dw, g, bias) in [
+                (2, 32, 5, 6, 8, 3, 3, 1, 1, 1, 1, 1, 1, 1, True),
+                (1, 16, 7, 7, 40, 3, 3, 2, 2, 1, 1, 1, 1, 1, False),
+                (2, 3, 9, 8, 5, 7, 7, 2, 2, 3, 3, 1, 1, 1, True),
+                (1, 6, 6, 7, 4, 1, 3, 1, 1, 0, 1, 1, 1, 1, False),
+                (1, 32, 7, 6, 70, 3, 3, 1, 2, 2, 1, 2, 1, 1, True),
+                (2, 64, 4, 4, 130, 1, 1, 1, 1, 0, 0, 1, 1, 1, False),
+                (2, 24, 6, 5, 24, 3, 3, 1, 1, 1, 1, 1, 1, 24, True),
+                (1, 8, 7, 7, 16, 5, 5, 2, 2, 2, 2, 1, 1, 8, False),
+                (2, 16, 5, 5, 32, 3, 3, 1, 1, 1, 1, 1, 1, 4, False),
+                (1, 64, 4, 5, 64, 3, 3, 1, 1, 1, 1, 1, 1, 2, True),
+                (1, 64, 5, 5, 96, 3, 3, 1, 1, 1, 1, 1, 1, 2, True),
+                (1, 224, 4, 4, 224, 3, 3, 1, 1, 1, 1, 1, 1, 2, False)]:
+            cg = c // g
+            og = o // g
+            vals = _vals(n * c * h * w)
+            wv = _vals(cg * kh * kw * o, seed=5)
+            bv = _vals(o, seed=2) if bias else None
+            wcl = [wv[((i // o % cg + i % o // og * cg) * kh * kw +
+                       i // o // cg) * og + i % og]
+                   for i in range(len(wv))]
+            wt = _from(wcl, [kh * kw * cg, o], dt)
+            oh = (h + 2 * ph - dh * (kh - 1) - 1) // sh + 1
+            ow = (w + 2 * pw - dw * (kw - 1) - 1) // sw + 1
+            want = nhwc(_ref_conv(vals, wv, bv, n, c, h, w, o, g, kh, kw, sh,
+                                  sw, ph, pw, dh, dw), n, o, oh * ow)
+            for layout in [0, 1]:
+                src = vals if layout == 0 else nhwc(vals, n, c, h * w)
+                x = _from(src, [n, c * h * w], dt)
+                before = device.fallbacks.n
+                y = ops.conv(x, wt, layout, c, h, w, o, kh, kw, sh, sw, ph,
+                             pw, dh, dw, g)
+                if bias:
+                    y = ops.add_p(y, from_list(bv, dt), core.BC_R_ROW)
+                assert [y.shape[0], y.shape[1]] == [n * oh * ow, o]
+                got = list(device.host(y))[:len(want)]
+                for i in range(len(want)):
+                    assert abs(got[i] - want[i]) <= 2e-3 * max(
+                        1.0, abs(want[i])), (i, got[i], want[i])
+                _on_gpu(before)
+
+    def test_conv_new_batch_reuses_kernel(self):
+        dt = core.F32
+        kernels.init_dtype(dt)
+        c, h, w, o = 16, 6, 5, 24
+        wv = _vals(9 * c * o, seed=5)
+        wt = _from([wv[(i // o % c * 9 + i // o // c) * o + i % o]
+                    for i in range(len(wv))], [9 * c, o], dt)
+        compiled = []
+        for n in [3, 1, 4, 2]:
+            vals = _vals(n * c * h * w)
+            want = _ref_conv(vals, wv, None, n, c, h, w, o, 1, 3, 3, 1, 1, 1,
+                             1, 1, 1)
+            x = _from(vals, [n, c * h * w], dt)
+            before = device.fallbacks.n
+            start = kernels.counter.n
+            y = ops.conv(x, wt, 0, c, h, w, o, 3, 3, 1, 1, 1, 1, 1, 1)
+            compiled.append(kernels.counter.n - start)
+            got = list(device.host(y))
+            hw = h * w
+            for i in range(len(want)):
+                j = (i // (hw * o) * hw + i % hw) * o + i // hw % o
+                assert abs(got[j] - want[i]) <= 2e-3 * max(1.0, abs(want[i]))
+            _on_gpu(before)
+        assert compiled[2:] == [0, 0]
+
+    def test_grouped_and_depthwise_conv(self):
+        for dt in [core.F64, core.F32, core.F16]:
+            kernels.init_dtype(dt)
+            for (n, c, h, w, o, g, kh, kw, s, p, d) in [
+                    (2, 4, 5, 5, 6, 2, 3, 3, 1, 1, 1),
+                    (1, 4, 6, 6, 4, 4, 3, 3, 2, 1, 1),
+                    (2, 3, 6, 5, 6, 3, 3, 2, 1, 1, 2),
+                    (1, 2, 5, 5, 2, 2, 5, 5, 1, 2, 1)]:
+                vals = _vals(n * c * h * w)
+                wv = _vals(c * kh * kw * (o // g), seed=4)
+                bv = _vals(o, seed=2)
+                x = _from(vals, [n, c * h * w], dt)
+                wt = _from(wv, [c * kh * kw, o // g], dt)
+                oh = (h + 2 * p - d * (kh - 1) - 1) // s + 1
+                ow = (w + 2 * p - d * (kw - 1) - 1) // s + 1
+                want = _ref_conv(vals, wv, bv, n, c, h, w, o, g, kh, kw, s, s,
+                                 p, p, d, d)
+                before = device.fallbacks.n
+                if g == c:
+                    y = runtime.depthwise_conv2d(x, wt, from_list(bv, dt), c,
+                                                 h, w, kh, kw, s, s, p, p, d,
+                                                 d, o // c)
+                else:
+                    cols = runtime.im2col2(x, c, h, w, kh, kw, s, s, p, p, d,
+                                           d)
+                    inner = c // g * kh * kw
+                    y = runtime.tensor_bmm(cols, wt, g, n * oh * ow, o // g,
+                                           inner, 0, 0, c * kh * kw, o // g,
+                                           o, inner, inner * (o // g), o // g,
+                                           n * oh * ow * o, n * oh * ow)
+                    y = ops.add_p(y, from_list(bv, dt), core.BC_R_ROW)
+                    y = runtime.col2chw(y, n, oh * ow, o)
+                tol = {core.F64: 1e-12, core.F32: 1e-4, core.F16: 0.1}[dt]
+                got = list(device.host(y))[:len(want)]
+                for i in range(len(want)):
+                    assert abs(got[i] - want[i]) <= tol * max(1.0,
+                                                              abs(want[i]))
+                _on_gpu(before)
+
+    def test_nhwc_layouts_match_nchw(self):
+        def nhwc(v, n, c, hw):
+            return [v[(i // (hw * c) * c + i % c) * hw + i // c % hw]
+                    for i in range(n * c * hw)]
+        for dt in [core.F64, core.F32]:
+            kernels.init_dtype(dt)
+            n, c, h, w, g, k, s, p = 2, 4, 6, 5, 2, 3, 2, 1
+            vals = _vals(n * c * h * w)
+            x = _from(vals, [n, c * h * w], dt)
+            xl = _from(nhwc(vals, n, c, h * w), [n * h * w, c], dt)
+            oh = (h + 2 * p - k) // s + 1
+            ow = (w + 2 * p - k) // s + 1
+            wv = _vals(c * k * k * 2, seed=4)
+            wt = _from(wv, [c * k * k, 2], dt)
+            before = device.fallbacks.n
+            for layout in [1, 2, 3]:
+                src = xl if layout & 1 else x
+                cases = [
+                    (runtime.depthwise_conv2d(x, wt, core.NULLTENSOR, c, h, w,
+                                              k, k, s, s, p, p, 1, 1, 2),
+                     runtime.depthwise_conv2d(src, wt, core.NULLTENSOR, c, h,
+                                              w, k, k, s, s, p, p, 1, 1, 2,
+                                              layout), c * 2, oh * ow),
+                    (runtime.avg_pool2d(x, c, h, w, k, k, s, s, p, p, False,
+                                        True),
+                     runtime.avg_pool2d(src, c, h, w, k, k, s, s, p, p, False,
+                                        True, layout), c,
+                     runtime.pool_out(h, k, s, p, True) *
+                     runtime.pool_out(w, k, s, p, True)),
+                    (runtime.adaptive_avg_pool2d(x, c, h, w, 2, 3),
+                     runtime.adaptive_avg_pool2d(src, c, h, w, 2, 3, layout),
+                     c, 6)]
+                for ref, got, co, ohw in cases:
+                    want = list(device.host(ref))[:n * co * ohw]
+                    if layout & 2:
+                        want = nhwc(want, n, co, ohw)
+                    self._check(got, want, dt)
+            cols = runtime.im2col2(xl, c, h, w, k, k, s, s, p, p, 1, 1, 1)
+            want = list(device.host(runtime.im2col2(x, c, h, w, k, k, s, s,
+                                                    p, p, 1, 1)))
+            self._check(cols, want[:n * oh * ow * c * k * k], dt)
+            _on_gpu(before)
+
+    def test_transposed_convolution(self):
+        for dt in [core.F64, core.F32]:
+            kernels.init_dtype(dt)
+            for (n, c, h, w, o, kh, kw, sh, sw, ph, pw, dh, dw, oph, opw) in [
+                    (2, 3, 4, 5, 2, 3, 3, 2, 2, 1, 1, 1, 1, 1, 0),
+                    (1, 2, 3, 3, 3, 2, 3, 1, 3, 0, 1, 2, 1, 0, 2),
+                    (1, 1, 1, 6, 2, 1, 4, 1, 2, 0, 1, 1, 1, 0, 1)]:
+                oh = (h - 1) * sh - 2 * ph + dh * (kh - 1) + oph + 1
+                ow = (w - 1) * sw - 2 * pw + dw * (kw - 1) + opw + 1
+                vals = _vals(n * c * h * w)
+                wv = _vals(c * kh * kw * o, seed=6)
+                want = [0.0] * (n * o * oh * ow)
+                for b in range(n):
+                    for ic in range(c):
+                        for iy in range(h):
+                            for ix in range(w):
+                                xv = vals[((b * c + ic) * h + iy) * w + ix]
+                                for a in range(kh):
+                                    for e in range(kw):
+                                        oy = iy * sh - ph + a * dh
+                                        ox = ix * sw - pw + e * dw
+                                        if 0 <= oy < oh and 0 <= ox < ow:
+                                            for oc in range(o):
+                                                want[((b * o + oc) * oh + oy) *
+                                                     ow + ox] += xv * wv[
+                                                    (ic * kh * kw + a * kw +
+                                                     e) * o + oc]
+                x = _from(vals, [n, c * h * w], dt)
+                wt = _from(wv, [c * kh * kw, o], dt)
+                before = device.fallbacks.n
+                cols = runtime.im2col_t(x, c, h, w, kh, kw, sh, sw, ph, pw,
+                                        dh, dw, oh, ow)
+                y = runtime.tensor_matmul(cols, wt, n * oh * ow, o,
+                                          c * kh * kw, 0, 0)
+                self._check(runtime.col2chw(y, n, oh * ow, o), want, dt)
+                _on_gpu(before)
+
+    def test_host_loops_match_the_kernels(self):
+        # the loops a failed launch falls back to, against the same
+        # references through the device
+        vals = _vals(2 * 3 * 5 * 4)
+        x = _from(vals, [2, 60], core.F64)
+        params = [1, 3, 4, 2, 3, 1, 20, 5, 0, 0, 0, 4, 2, 3]
+        a = runtime.strided(x, [4, 2, 3], [1, 20, 5], 0)
+        from rpython.metatensor import devops
+        b = devops.strided_cpu([x], [0], params, 0.0, a.shape)
+        assert list(device.host(a))[:24] == list(b.host)[:24]
+        p = devops._pool_params(core.POOL_AVG, 5, 4, 2, 2, 3, 2, 2, 2, 1, 0,
+                                1, 1, 1, 1, 0)
+        a = devops._pool(x, core.NULLTENSOR, core.NULLTENSOR, p, 6 * 4,
+                         core._shape2(2, 12))
+        b = devops.pool_cpu(x, core.NULLTENSOR, core.NULLTENSOR, p, 24,
+                            a.shape)
+        self._check(a, list(b.host)[:24], core.F64)
+
+
+    def test_place_into_writes_the_box_in_place(self):
+        cases = [([4, 5], [1, 2], [2, 3]),
+                 ([3, 4, 5], [0, 1, 4], [3, 2, 1]),
+                 ([2, 3, 4, 2, 2], [0, 1, 1, 1, 0], [2, 1, 3, 1, 1]),
+                 ([7, 6, 5], [2, 0, 3], [1, 6, 1]),
+                 ([6], [2], [3])]
+        for dt in [core.F64, core.F32, core.F16]:
+            kernels.init_dtype(dt)
+            for shape, starts, sizes in cases:
+                vals = _vals(_prod(shape))
+                box = _vals(_prod(sizes), seed=3)
+                x = _from(vals, shape, dt)
+                src = _from(box, sizes, dt)
+                want = []
+                for i in range(_prod(shape)):
+                    xs = _coords(i, shape)
+                    bs = [xs[j] - starts[j] for j in range(len(xs))]
+                    if all([0 <= bs[j] < sizes[j] for j in range(len(bs))]):
+                        k = 0
+                        for j in range(len(bs)):
+                            k = k * sizes[j] + bs[j]
+                        want.append(box[k])
+                    else:
+                        want.append(vals[i])
+                dptr = x.dptr
+                before = device.fallbacks.n
+                y = ops.place_box_into(x, src, shape, starts, sizes)
+                assert y == x
+                if dptr != 0 and 'RTENSOR_CPU' not in __import__('os').environ:
+                    assert x.dptr == dptr
+                self._check(x, want, dt)
+                _on_gpu(before)
+
+
+class TestDataMovementJit(LLJitMixin):
+
+    def _tridiag(self, n, jit):
+        driver = JitDriver(greens=[], reds=['i', 'n', 'b', 'c', 'w', 's'])
+        rows = 5
+
+        def f(n):
+            b = runtime.place(from_list([1.0] * (rows * n)),
+                              from_list([2.0] * rows), [rows, n], [0, 0],
+                              [rows, 1])
+            c = from_list([0.25 * (k % 7) for k in range(rows * n)])
+            w = from_list([0.0] * rows)
+            s = from_list([0.0] * rows)
+            i = 1
+            while i < n:
+                driver.jit_merge_point(i=i, n=n, b=b, c=c, w=w, s=s)
+                prev = ops.strided_view(b, [rows], [n], i - 1)
+                w = ops.div(ops.strided_view(c, [rows], [n], i), prev)
+                cur = ops.strided_view(b, [rows], [n], i)
+                val = ops.sub(cur, ops.mul(w, ops.strided_view(c, [rows], [n],
+                                                           i - 1)))
+                old = ops.mul(ops.strided_view(b, [rows], [n], i), prev)
+                b = ops.place_box_into(b, val, [rows, n], [0, i], [rows, 1])
+                s = ops.add(s, old)
+                i += 1
+            return (ops.item(ops.sum(ops.mul(b, b))) +
+                    ops.item(ops.sum(ops.mul(w, w))) +
+                    ops.item(ops.sum(s)))
+        return self.meta_interp(f, [n]) if jit else f(n)
+
+    def test_place_into_in_a_loop_reads_the_values_before_the_write(self):
+        want = self._tridiag(12, False)
+        got = self._tridiag(12, True)
+        assert abs(got - want) <= 1e-9 * abs(want)
+
+    def test_library_ops_in_a_loop(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'w', 'acc'])
+        vals = _vals(2 * 3 * 4 * 4)
+
+        def f(n):
+            x = _load([2, 3 * 4 * 4], vals)
+            w = _load([6], [1.0, 0.0, 2.0, 1.0, 0.5, 0.25])
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, w=w, acc=acc)
+                h = ops.add(x, x)
+                t = runtime.strided(h, [2, 16, 3], [48, 1, 16], 0)
+                c = runtime.cat([t, x], 2)
+                p = runtime.pad(c, [2, 96], [0, 0, 1, 1], 1.0)
+                q = runtime.adaptive_avg_pool2d(x, 3, 4, 4, 2, 2)
+                acc += ops.item(ops.sum(ops.mul(p, p)))
+                acc += ops.item(ops.sum(q))
+                q = runtime.avg_pool2d(x, 3, 4, 4, 3, 3, 2, 2, 1, 1, False,
+                                       True)
+                acc += ops.item(ops.sum(q))
+                q = runtime.take(x, w, 2, 2, 1, 2, 1, 0)
+                acc += ops.item(ops.sum(q))
+                q = runtime.depthwise_conv2d(x, w, core.NULLTENSOR, 3, 4, 4,
+                                             1, 2, 1, 1, 0, 0, 1, 1, 1)
+                acc += ops.item(ops.sum(q))
+                q = runtime.im2col2(x, 3, 4, 4, 1, 2, 1, 1, 0, 1, 1, 2)
+                acc += ops.item(ops.sum(q))
+                q = runtime.im2col_t(x, 3, 4, 4, 2, 2, 2, 2, 0, 0, 1, 1, 8,
+                                     8)
+                acc += ops.item(ops.sum(q))
+                n -= 1
+            return acc
+        expect = f(3)
+        res = self.meta_interp(f, [3])
+        assert abs(res - expect) < 1e-9 * abs(expect)
+
+
+def test_ttir_of_row_kernels_is_unchanged():
+    import hashlib
+    from rpython.metatensor import ttir
+    h = hashlib.sha1()
+    count = 0
+    for k in _ttir_cases_rows():
+        src = ttir.to_ttir(k, 'kname')
+        h.update('%s\t%s\n' % (kernels.kernel_key(k),
+                                hashlib.sha1(src).hexdigest()))
+        count += 1
+    assert count == 1953
+    assert h.hexdigest() == '887f3bb14bcc1f9592342f4aee3b3bc8393a54c0'
+
+
+def _ref_rows(name, vals, rows, cols, gamma=None, beta=None):
+    out = []
+    extra = []
+    for r in range(rows):
+        x = vals[r * cols:(r + 1) * cols]
+        if name == 'softmax' or name == 'logsoftmax':
+            m = max(x)
+            s = sum([math.exp(v - m) for v in x])
+            if name == 'softmax':
+                out.extend([math.exp(v - m) / s for v in x])
+            else:
+                out.extend([v - m - math.log(s) for v in x])
+        elif name == 'layernorm':
+            mean = sum(x) * 1e-3
+            d = [v - mean for v in x]
+            sd = math.sqrt(sum([v * v for v in d]) * 1e-3 + 1e-5)
+            out.extend([d[j] / sd * gamma[j] + beta[j] for j in range(cols)])
+        else:
+            prod = [x[j] * gamma[j] for j in range(cols)]
+            extra.extend(prod)
+            out.append(sum([max(p, v) for p, v in zip(prod, x)]))
+    return out, extra
+
+
+class TestWideRows(object):
+
+    def teardown_method(self, meth):
+        core.note_dtype(core.F64)
+
+    def _gpu(self):
+        import os
+        return 'RTENSOR_CPU' not in os.environ
+
+    def test_fused_chains_on_rows_wider_than_a_tile(self):
+        names = ['softmax', 'logsoftmax', 'layernorm', 'rowsum_out']
+        chains = _row_chains()
+        rows = 3
+        for dt in [core.F64, core.F32, core.F16]:
+            kernels.init_dtype(dt)
+            tol = {core.F64: 1e-9, core.F32: 1e-4, core.F16: 3e-2}[dt]
+            for cols, static in [(9000, False), (9000, True), (4097, True),
+                                 (300, False)]:
+                vals = [((i * 37) % 101 - 50) * 0.02 for i in range(rows * cols)]
+                gamma = [1.0 + (j % 7) * 0.1 for j in range(cols)]
+                beta = [(j % 5) * 0.01 for j in range(cols)]
+                x = _from(vals, [rows, cols], dt)
+                g = from_list(gamma, dt)
+                b = from_list(beta, dt)
+                for ci in range(len(names)):
+                    ninputs, nodes, consts, outputs = chains[ci]
+                    k = _mk_kernel(ninputs, nodes, dt, 0,
+                                   cols if static else 0, consts, outputs)
+                    kernels.compile_or_reuse(k)
+                    before = device.unfused_count()
+                    cpu = device.fallbacks.n
+                    r = runtime.launch(k, x, g, b)
+                    want, extra = _ref_rows(names[ci], vals, rows, cols,
+                                            gamma, beta)
+                    got = list(device.host(r))[:len(want)]
+                    for i in range(len(want)):
+                        assert abs(got[i] - want[i]) <= tol * max(
+                            1.0, abs(want[i]) * (100 if ci == 3 else 1)), (
+                            names[ci], dt, cols, i, got[i], want[i])
+                    if extra:
+                        e = list(device.host(r.extra[0]))
+                        for i in range(len(extra)):
+                            assert abs(e[i] - extra[i]) <= tol * max(
+                                1.0, abs(extra[i]))
+                    if self._gpu():
+                        assert device.unfused_count() == before
+                        assert device.fallbacks.n == cpu
+                        if cols > core.config.block:
+                            assert k.wfn != 0
+
+    def test_eager_row_reductions_on_wide_rows(self):
+        rows, cols = 2, 10000
+        vals = [((i * 13) % 97) * 0.5 for i in range(rows * cols)]
+        for dt in [core.F64, core.F32]:
+            kernels.init_dtype(dt)
+            x = _from(vals, [rows, cols], dt)
+            cpu = device.fallbacks.n
+            s = list(device.host(ops.sum(x, 1)))
+            m = list(device.host(ops.max(x, 1)))
+            for r in range(rows):
+                row = vals[r * cols:(r + 1) * cols]
+                assert abs(s[r] - sum(row)) <= 1e-5 * sum(row)
+                assert m[r] == max(row)
+            if self._gpu():
+                assert device.fallbacks.n == cpu
+
+
+class TestNarrowRows(object):
+
+    def teardown_method(self, meth):
+        core.note_dtype(core.F64)
+
+    def _gpu(self):
+        import os
+        return 'RTENSOR_CPU' not in os.environ
+
+    def test_fused_chains_on_narrow_rows(self):
+        names = ['softmax', 'logsoftmax', 'layernorm', 'rowsum_out']
+        chains = _row_chains()
+        for dt in [core.F64, core.F32, core.F16]:
+            kernels.init_dtype(dt)
+            tol = {core.F64: 1e-9, core.F32: 1e-4, core.F16: 3e-2}[dt]
+            for rows, cols, static in [(1001, 2, False), (37, 5, False),
+                                       (300, 49, False), (9, 256, False),
+                                       (70, 3, True), (5, 100, True)]:
+                vals = [((i * 37) % 101 - 50) * 0.02 for i in range(rows * cols)]
+                gamma = [1.0 + (j % 7) * 0.1 for j in range(cols)]
+                beta = [(j % 5) * 0.01 for j in range(cols)]
+                x = _from(vals, [rows, cols], dt)
+                g = from_list(gamma, dt)
+                b = from_list(beta, dt)
+                for ci in range(len(names)):
+                    ninputs, nodes, consts, outputs = chains[ci]
+                    k = _mk_kernel(ninputs, nodes, dt, 0,
+                                   cols if static else 0, consts, outputs)
+                    kernels.compile_or_reuse(k)
+                    before = device.unfused_count()
+                    cpu = device.fallbacks.n
+                    r = runtime.launch(k, x, g, b)
+                    want, extra = _ref_rows(names[ci], vals, rows, cols,
+                                            gamma, beta)
+                    got = list(device.host(r))[:len(want)]
+                    for i in range(len(want)):
+                        assert abs(got[i] - want[i]) <= tol * max(
+                            1.0, abs(want[i]) * (100 if ci == 3 else 1)), (
+                            names[ci], dt, cols, i, got[i], want[i])
+                    if extra:
+                        e = list(device.host(r.extra[0]))
+                        for i in range(len(extra)):
+                            assert abs(e[i] - extra[i]) <= tol * max(
+                                1.0, abs(extra[i]))
+                    if self._gpu():
+                        assert device.unfused_count() == before
+                        assert device.fallbacks.n == cpu
+                        assert runtime.narrow_slot(k, cols) >= 0
+
+    def test_row_root_chain_is_one_kernel(self):
+        nodes = [(core.SUM, 0, -1, 1), (core.MUL, 3, 1, core.BC_R_SCALAR),
+                 (core.ADD, 4, 2, core.BC_R_SCALAR), (core.SQRT, 5, -1, 0)]
+        for dt in [core.F64, core.F32, core.F16]:
+            kernels.init_dtype(dt)
+            tol = {core.F64: 1e-9, core.F32: 1e-4, core.F16: 3e-2}[dt]
+            for rows, cols in [(333, 3), (40, 49), (7, 1000), (3, 9000)]:
+                vals = [((i * 13) % 29) * 0.1 for i in range(rows * cols)]
+                x = _from(vals, [rows, cols], dt)
+                k = _mk_kernel(1, nodes, dt, 0, 0, (1.0 / cols, 0.5))
+                kernels.compile_or_reuse(k)
+                assert k.sumroot == 2
+                before = device.unfused_count()
+                r = runtime.launch(k, x, x, x)
+                assert r.size == rows
+                got = list(device.host(r))
+                for i in range(rows):
+                    row = vals[i * cols:(i + 1) * cols]
+                    want = math.sqrt(sum(row) / cols + 0.5)
+                    assert abs(got[i] - want) <= tol * max(1.0, want), (
+                        dt, rows, cols, i, got[i], want)
+                if self._gpu():
+                    assert device.unfused_count() == before
+
+
+def _half(bits):
+    e = (bits >> 10) & 31
+    m = bits & 1023
+    v = (1.0 + m / 1024.0) * 2.0 ** (e - 15) if e else m / 1024.0 * 2.0 ** -14
+    return -v if bits & 32768 else v
+
+
+class TestFallbackAccounting(object):
+
+    def teardown_method(self, meth):
+        core.note_dtype(core.F64)
+
+    def test_refused_fused_kernel_counts_and_uses_cached_scalars(self):
+        import os
+        k = _mk_kernel(1, [(core.MUL, 0, 1, core.BC_R_SCALAR),
+                           (core.ADD, 2, 1, core.BC_R_SCALAR)],
+                       core.F64, 3, 0, (2.5,))
+        kernels.compile_or_reuse(k)
+        k.n = 5
+        x = from_list([1.0, 2.0, 3.0, 4.0])
+        before = device.unfused_count()
+        r = runtime.launch(k, x, core.NULLTENSOR, core.NULLTENSOR)
+        assert list(device.host(r))[:4] == [5.0, 7.5, 10.0, 12.5]
+        if 'RTENSOR_CPU' not in os.environ:
+            assert device.unfused_count() == before + 1
+            assert runtime.scalar_of(2.5, core.F64).dptr != 0
+        else:
+            assert device.unfused_count() == before
+
+    def test_views_of_a_host_tensor_share_one_upload(self):
+        import os
+        t = from_list([float(i) for i in range(6)])
+        a = ops.reshape(t, [2, 3])
+        b = ops.reshape(t, [3, 2])
+        if 'RTENSOR_CPU' not in os.environ:
+            assert t.dptr != 0
+            assert a.dptr == t.dptr and b.dptr == t.dptr
+        assert list(device.host(ops.add(a, a)))[:6] == [
+            2.0 * i for i in range(6)]
+
+    def test_dump_writes_raw_elements(self, tmpdir):
+        import os, struct
+        vals = [1.5, -2.25, 3.0, 65504.0, 0.0]
+        fmt = {core.F64: 'd', core.F32: 'f', core.F16: 'e'}
+        for dt in [core.F64, core.F32, core.F16]:
+            kernels.init_dtype(dt)
+            for on_device in [False, True]:
+                t = from_list(vals, dt)
+                if on_device:
+                    t = ops.add(t, runtime.scalar_of(0.0, dt))
+                path = str(tmpdir.join('d%d%d' % (dt, on_device)))
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0644)
+                assert device.dump(t, fd)
+                os.close(fd)
+                data = open(path, 'rb').read()
+                if fmt[dt] == 'e':
+                    got = [_half(b) for b in struct.unpack(
+                        '<%dH' % len(vals), data)]
+                else:
+                    got = list(struct.unpack('<%d%s' % (len(vals), fmt[dt]),
+                                             data))
+                assert got == vals
+
+
+class TestCrossAttention(object):
+
+    def test_scores_and_context_with_another_key_length(self):
+        heads, dh, rows, krows, seqs = 2, 3, 4, 5, 2
+        d = heads * dh
+        qv = [((i * 7) % 11 - 5) * 0.1 for i in range(seqs * rows * d)]
+        kv = [((i * 5) % 13 - 6) * 0.1 for i in range(seqs * krows * d)]
+        q = nn.Tensor(_from(qv, [seqs * rows, d], core.F64))
+        k = nn.Tensor(_from(kv, [seqs * krows, d], core.F64))
+        s = q.attn_scores(k, heads, rows, dh, seqs=seqs, krows=krows)
+        got = list(device.host(s.t))
+        want = []
+        for sq in range(seqs):
+            for h in range(heads):
+                for i in range(rows):
+                    for j in range(krows):
+                        want.append(sum(
+                            [qv[(sq * rows + i) * d + h * dh + e] *
+                             kv[(sq * krows + j) * d + h * dh + e]
+                             for e in range(dh)]))
+        assert [s.t.shape[0], s.t.shape[1]] == [seqs * heads * rows, krows]
+        for i in range(len(want)):
+            assert abs(got[i] - want[i]) < 1e-12
+        c = s.attn_context(k, heads, rows, dh, seqs=seqs, krows=krows)
+        got = list(device.host(c.t))
+        for sq in range(seqs):
+            for i in range(rows):
+                for h in range(heads):
+                    for e in range(dh):
+                        w = sum([want[((sq * heads + h) * rows + i) * krows +
+                                      j] *
+                                 kv[(sq * krows + j) * d + h * dh + e]
+                                 for j in range(krows)])
+                        assert abs(got[(sq * rows + i) * d + h * dh + e] -
+                                   w) < 1e-12
+
+
+class TestViewFusion(LLJitMixin):
+
+    def setup_method(self, meth):
+        core.policy.static = True
+        core.policy.seen = []
+
+    def teardown_method(self, meth):
+        import os
+        if 'RTENSOR_CPU' in os.environ:
+            return
+        for key, k in kernels.kernel_cache.kernels.items():
+            if ',11:' in key:
+                assert k.fn != 0, key
+
+    def test_slices_fuse_into_the_kernel_that_reads_them(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'acc'])
+        vals = _vals(30)
+
+        def f(n):
+            x = _load([6, 5], vals)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, acc=acc)
+                a = ops.strided_view(x, [4, 5], [5, 1], 5)
+                b = ops.strided_view(x, [4, 5], [5, 1], 0)
+                c = ops.strided_view(x, [4, 5], [1, 4], 2)
+                y = ops.mul(ops.sub(a, b), ops.add(c, a))
+                acc += ops.item(ops.sum(y))
+                n -= 1
+            return acc
+        expect = 0.0
+        for i in range(4):
+            for j in range(5):
+                a = vals[5 + i * 5 + j]
+                b = vals[i * 5 + j]
+                c = vals[2 + i + j * 4]
+                expect += (a - b) * (c + a)
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+        self.check_simple_loop(call_r=1)
+
+    def test_box_assignment_fuses_with_its_value(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'acc'])
+        vals = _vals(12)
+
+        def f(n):
+            x = _load([3, 4], vals)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, acc=acc)
+                v = ops.strided_view(x, [3, 2], [4, 1], 2)
+                v = ops.mul(v, v)
+                y = ops.place_box(x, v, [3, 4], [0, 1], [3, 2])
+                z = ops.mul(y, ops.strided_view(x, [3, 4], [4, 1], 0))
+                acc += ops.item(ops.sum(z))
+                n -= 1
+            return acc
+        expect = 0.0
+        for i in range(3):
+            for j in range(4):
+                y = vals[i * 4 + j]
+                if 1 <= j < 3:
+                    y = vals[i * 4 + j + 1] ** 2
+                expect += y * vals[i * 4 + j]
+        before = set(kernels.kernel_cache.kernels)
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+        self.check_simple_loop(call_r=1)
+        added = set(kernels.kernel_cache.kernels) - before
+        assert [k for k in added if k.startswith("2,") and ",11:" in k], added
+
+    def test_broadcast_view_and_reading_a_placed_value(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'w', 'acc'])
+        vals = _vals(12)
+        wv = [1.0, -2.0, 0.5, 3.0, 4.0, 5.0]
+
+        def f(n):
+            x = _load([4, 3], vals)
+            w = _load([2, 3], wv)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, w=w, acc=acc)
+                r = ops.strided_view(w, [3], [1], 3)
+                y = ops.add(x, r)
+                p = ops.place_box(y, ops.strided_view(y, [1, 3], [3, 1], 0),
+                                  [4, 3], [3, 0], [1, 3])
+                q = ops.strided_view(p, [2, 3], [3, 1], 6)
+                acc += ops.item(ops.sum(ops.mul(q, q)))
+                n -= 1
+            return acc
+        y = [vals[i] + wv[3 + i % 3] for i in range(12)]
+        p = y[:9] + y[:3]
+        expect = sum([v * v for v in p[6:12]])
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+
+    def test_eager_views_match_strided_and_place(self):
+        vals = _vals(24)
+        box = _vals(6, seed=4)
+        for dt in [core.F64, core.F32]:
+            kernels.init_dtype(dt)
+            x = _from(vals, [2, 3, 4], dt)
+            src = _from(box, [2, 1, 3], dt)
+            vid = ops._strided_vid([3, 2, 2], [4, 12, 1], 1)
+            ops._ensure_view(vid, x)
+            got = ops.tensor_gather(x, core.view_param(vid))
+            want = runtime.strided(x, [3, 2, 2], [4, 12, 1], 1)
+            assert [got.shape[j] for j in range(3)] == [3, 2, 2]
+            assert list(device.host(got)) == list(device.host(want))
+            pad, bx = ops._place_vids([2, 3, 4], [0, 1, 1], [2, 1, 3], True)
+            one = runtime.scalar_of(1.0, dt)
+            for v, t in [(pad, src), (bx, one)]:
+                ops._ensure_view(v, t)
+            m = ops.tensor_gather(one, core.view_param(bx))
+            pv = ops.tensor_gather(src, core.view_param(pad))
+            got = ops.add(ops.binary(m, x, core.B_KEEP_Z), pv)
+            want = runtime.place(x, src, [2, 3, 4], [0, 1, 1], [2, 1, 3])
+            assert list(device.host(got)) == list(device.host(want))
+        core.note_dtype(core.F64)
+
+    def test_value_read_through_a_view_is_not_an_extra_output(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'acc'])
+        vals = _vals(16)
+
+        def f(n):
+            x = _load([4, 4], vals)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, acc=acc)
+                v = ops.strided_view(x, [3, 2], [4, 1], 1)
+                y = ops.mul(v, v)
+                p = ops.place_box(x, y, [4, 4], [0, 1], [3, 2])
+                acc += ops.item(ops.sum(p))
+                acc += ops.item(ops.sum(ops.add(y, y)))
+                n -= 1
+            return acc
+        expect = 0.0
+        for i in range(4):
+            for j in range(4):
+                y = vals[i * 4 + j]
+                if i < 3 and 1 <= j < 3:
+                    y = vals[i * 4 + j] ** 2
+                    expect += 2 * y
+                expect += y
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+
+    def test_loop_index_slice_and_assignment(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'acc'])
+        vals = _vals(12)
+
+        def f(n):
+            x = _load([3, 4], vals)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, acc=acc)
+                i = n % 3
+                v = ops.strided_view(x, [3, 1], [4, 1], i + 1)
+                v = ops.add(v, v)
+                y = ops.place_box(x, v, [3, 4], [0, i], [3, 1])
+                acc += ops.item(ops.sum(ops.mul(y, x)))
+                n -= 1
+            return acc
+        def ref(n):
+            acc = 0.0
+            while n > 0:
+                i = n % 3
+                for r in range(3):
+                    for c in range(4):
+                        y = vals[r * 4 + c]
+                        if c == i:
+                            y = 2 * vals[r * 4 + i + 1]
+                        acc += y * vals[r * 4 + c]
+                n -= 1
+            return acc
+        res = self.meta_interp(f, [12])
+        assert abs(res - ref(12)) < 1e-9
+
+    def test_loop_index_box_wider_than_one(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'acc'])
+        vals = _vals(20)
+
+        def f(n):
+            x = _load([4, 5], vals)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, acc=acc)
+                i = n % 3
+                v = ops.strided_view(x, [2, 3], [5, 1], 5 + i)
+                v = ops.mul(v, v)
+                y = ops.place_box(x, v, [4, 5], [i, i], [2, 3])
+                acc += ops.item(ops.sum(ops.mul(y, x)))
+                n -= 1
+            return acc
+        def ref(n):
+            acc = 0.0
+            while n > 0:
+                i = n % 3
+                for r in range(4):
+                    for c in range(5):
+                        y = vals[r * 5 + c]
+                        if i <= r < i + 2 and i <= c < i + 3:
+                            y = vals[5 + i + (r - i) * 5 + (c - i)] ** 2
+                        acc += y * vals[r * 5 + c]
+                n -= 1
+            return acc
+        res = self.meta_interp(f, [12])
+        assert abs(res - ref(12)) < 1e-9
+
+    def test_guard_failure_rebuilds_a_view_at_a_loop_index(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'acc'])
+        vals = _vals(12)
+
+        def f(n):
+            x = _load([3, 4], vals)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, acc=acc)
+                i = n % 3
+                v = ops.strided_view(x, [3, 1], [4, 1], i)
+                if n % 7 == 0:
+                    v = ops.add(v, v)
+                acc += ops.item(ops.sum(ops.mul(v, v)))
+                n -= 1
+            return acc
+        def ref(n):
+            acc = 0.0
+            while n > 0:
+                i = n % 3
+                k = 2.0 if n % 7 == 0 else 1.0
+                for r in range(3):
+                    acc += (k * vals[r * 4 + i]) ** 2
+                n -= 1
+            return acc
+        res = self.meta_interp(f, [40])
+        assert abs(res - ref(40)) < 1e-9
+
+    def test_value_of_the_box_size_is_not_checked_against_the_output(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'y', 'acc'])
+        vals = _vals(12)
+        yv = _vals(6, seed=5)
+
+        def f(n):
+            x = _load([3, 4], vals)
+            y = _load([3, 2], yv)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, y=y, acc=acc)
+                p = ops.place_box(x, ops.mul(y, y), [3, 4], [0, 1], [3, 2])
+                acc += ops.item(ops.sum(p))
+                n -= 1
+            return acc
+        expect = 0.0
+        for r in range(3):
+            for c in range(4):
+                if 1 <= c < 3:
+                    expect += yv[r * 2 + c - 1] ** 2
+                else:
+                    expect += vals[r * 4 + c]
+        import os
+        before = device.unfused_count()
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+        if 'RTENSOR_CPU' not in os.environ:
+            assert device.unfused_count() == before
+
+    def test_big_value_placed_in_a_small_box_is_computed_once(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'acc'])
+        vals = _vals(24)
+
+        def f(n):
+            x = _load([4, 6], vals)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, acc=acc)
+                v = ops.strided_view(x, [2, 2], [6, 1], 7)
+                for k in range(10):
+                    v = ops.add(ops.mul(v, ops.strided_view(x, [2, 2], [6, 1], 8)),
+                                v)
+                p = ops.place_box(x, v, [4, 6], [1, 1], [2, 2])
+                acc += ops.item(ops.sum(p))
+                n -= 1
+            return acc
+        def ref():
+            out = list(vals)
+            for r in range(2):
+                for c in range(2):
+                    v = vals[7 + r * 6 + c]
+                    for k in range(10):
+                        v = v * vals[8 + r * 6 + c] + v
+                    out[(1 + r) * 6 + 1 + c] = v
+            return sum(out)
+        res = self.meta_interp(f, [5])
+        assert abs(res - 5 * ref()) < 1e-6 * abs(5 * ref())
+
+    def test_scalar_literal_in_a_view_and_as_a_broadcast(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'acc'])
+        vals = _vals(12)
+
+        def f(n):
+            x = _load([3, 4], vals)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, acc=acc)
+                one = runtime.scalar_of(1.0, core.F64)
+                v = ops.mul(ops.strided_view(x, [3, 2], [4, 1], 1), one)
+                y = ops.place_box(x, v, [3, 4], [0, 2], [3, 2])
+                acc += ops.item(ops.sum(ops.add(y, one)))
+                n -= 1
+            return acc
+        expect = 0.0
+        for r in range(3):
+            for c in range(4):
+                y = vals[r * 4 + c]
+                if c >= 2:
+                    y = vals[r * 4 + c - 1]
+                expect += y + 1.0
+        import os
+        before = device.unfused_count()
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+        if 'RTENSOR_CPU' not in os.environ:
+            assert device.unfused_count() == before
+
+    def test_forced_reshape_of_a_chain_materializes_the_chain_once(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'y', 'acc'])
+        vals = _vals(12)
+        yv = _vals(12, seed=3)
+
+        def f(n):
+            x = _load([3, 4], vals)
+            y = _load([3, 4], yv)
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, y=y, acc=acc)
+                c = ops.mul(ops.add(x, y), y)
+                v = ops.reshape(c, [4, 3])
+                acc += ops.item(ops.sum(ops.sum(v, 1)))
+                acc += ops.item(ops.sum(ops.add(c, x)))
+                n -= 1
+            return acc
+        c = [(vals[i] + yv[i]) * yv[i] for i in range(12)]
+        expect = sum(c) + sum([c[i] + vals[i] for i in range(12)])
+        before = set(kernels.kernel_cache.kernels)
+        res = self.meta_interp(f, [10])
+        assert abs(res - expect * 10) < 1e-9
+        added = set(kernels.kernel_cache.kernels) - before
+        assert not [k for k in added if ',11:' in k and ',1:' in k], added
+
+
+class TestTracingPressure(LLJitMixin):
+
+    def test_device_pressure_while_tracing_drops_the_heap_cache(self):
+        driver = JitDriver(greens=[], reds=['n', 'x', 'acc'])
+
+        class Box(object):
+            def __init__(self, t):
+                self.t = t
+
+        @jit.dont_look_inside
+        def pressure(n):
+            if n % 3 == 0:
+                core.tracing.pressure = True
+
+        def f(n):
+            x = Box(from_list([1.0, 2.0, 3.0]))
+            acc = 0.0
+            while n > 0:
+                driver.jit_merge_point(n=n, x=x, acc=acc)
+                pressure(n)
+                acc += ops.item(ops.sum(ops.mul(x.t, x.t)))
+                n -= 1
+            return acc
+        res = self.meta_interp(f, [12])
+        assert res == 14.0 * 12
+        assert not core.tracing.pressure

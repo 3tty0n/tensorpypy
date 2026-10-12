@@ -1,0 +1,578 @@
+import csv, json, os, statistics, sys, collections
+from rowdata import local
+
+
+def read_tsv(path):
+    if not os.path.exists(local(path)):
+        return []
+    with open(path) as f:
+        return list(csv.DictReader(f, delimiter="\t"))
+
+
+def med(xs):
+    xs = [float(x) for x in xs if x not in (None, "")]
+    return statistics.median(xs) if xs else None
+
+
+def fmt(v, spec="%.1f"):
+    return spec % v if v is not None else "n/a"
+
+
+def read_jsonl(path):
+    if not os.path.exists(local(path)):
+        return []
+    with open(path) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def known(v):
+    """compile_ms / first_run_ms are -1 when the system cannot separate them."""
+    return v if isinstance(v, (int, float)) and v >= 0 else None
+
+
+def compile_table(records, lines):
+    """Break-even is the iteration count after which a compiled system has repaid its first run vs torch eager."""
+    g = collections.defaultdict(lambda: collections.defaultdict(
+        lambda: collections.defaultdict(list)))
+    for r in records:
+        if r.get("kind") == "micro" and r.get("dtype", "float64") == "float64":
+            key = "micro v%s k%s n%s" % (r.get("variant"), r.get("k"), r.get("n"))
+            system = r.get("mode")
+        elif r.get("kind") == "models":
+            key, system = r.get("model"), r.get("system")
+        else:
+            continue
+        for field in ("compile_ms", "first_run_ms", "steady_us"):
+            if r.get(field) not in (None, ""):
+                g[key][system][field].append(float(r[field]))
+    rows = []
+    for key in sorted(g):
+        eager = g[key].get("torch-eager", {})
+        e_first = known(med(eager.get("first_run_ms", [])))
+        e_steady = med(eager.get("steady_us", []))
+        for system in ("torch-compile", "torch-compile-ro", "torch-compile-mat",
+                       "torch-tensorrt", "jax", "iree", "triton", "fused", "ours"):
+            if system not in g[key]:
+                continue
+            d = g[key][system]
+            compile_ms = known(med(d.get("compile_ms", [])))
+            first = known(med(d.get("first_run_ms", [])))
+            steady = med(d.get("steady_us", []))
+            if compile_ms is None and first is None:
+                continue
+            # torch.compile folds compile time into first_run_ms already.
+            paid = (first + (compile_ms or 0.0)) if first is not None else None
+            even = None
+            if (paid is not None and e_first is not None and steady
+                    and e_steady and e_steady > steady):
+                even = (paid - e_first) * 1000.0 / (e_steady - steady)
+            rows.append("| %s | %s | %s | %s | %s | %s |" % (
+                key, system, fmt(compile_ms), fmt(first), fmt(steady),
+                fmt(even, "%.0f")))
+    if rows:
+        lines.append("## Compilation overhead (median; break-even vs torch eager, iterations)\n")
+        lines.append("| workload | system | compile_ms | first_run_ms | steady_us | break-even |")
+        lines.append("|---|---|---|---|---|---|")
+        lines.extend(rows)
+        lines.append("")
+
+
+def warmup_table(records, lines):
+    """Warm-up trace from run_warmup.sh (kind=warmup), median over rounds."""
+    g = collections.defaultdict(lambda: collections.defaultdict(list))
+    for r in records:
+        if r.get("kind") != "warmup":
+            continue
+        key = (r.get("model"), r.get("system"), r.get("cache"))
+        for field in ("first_us", "steady_us", "steady_at", "crossover",
+                      "cold_compiles", "first_forward_compiles"):
+            if r.get(field) not in (None, ""):
+                g[key][field].append(r[field])
+    if not g:
+        return
+    lines.append("## Warm-up (median over rounds; steady_at/crossover in "
+                  "iterations, 'none' if never reached within N)\n")
+    lines.append("| model | system | cache | first (ms) | steady_at | "
+                  "steady_us | crossover vs eager |")
+    lines.append("|---|---|---|---|---|---|---|")
+    def numeric_med(xs):
+        nums = [x for x in xs if isinstance(x, (int, float))]
+        return med(nums) if nums else None
+    for key in sorted(g):
+        d = g[key]
+        first = numeric_med(d.get("first_us", []))
+        steady = numeric_med(d.get("steady_us", []))
+        sa = numeric_med(d.get("steady_at", []))
+        sa_str = "%.0f" % sa if sa is not None else "none"
+        co = numeric_med(d.get("crossover", []))
+        co_str = "%.0f" % co if co is not None else "none"
+        lines.append("| %s | %s | %s | %s | %s | %s | %s |" % (
+            key[0], key[1], key[2],
+            "%.2f" % (first / 1000.0) if first is not None else "n/a",
+            sa_str, fmt(steady), co_str))
+    lines.append("")
+
+    ours_compiles = {k: v for k, v in g.items()
+                     if k[1] == "ours" and v.get("cold_compiles")}
+    if ours_compiles:
+        lines.append("## Warm-up: kernel compiles (ours, median over rounds; "
+                      "cold_compiles = Triton subprocess compiles over the "
+                      "whole trace, first_forward_compiles = at iter 0)\n")
+        lines.append("| model | cache | cold_compiles | first_forward_compiles |")
+        lines.append("|---|---|---|---|")
+        for key in sorted(ours_compiles):
+            d = ours_compiles[key]
+            cc = numeric_med(d.get("cold_compiles", []))
+            ffc = numeric_med(d.get("first_forward_compiles", []))
+            lines.append("| %s | %s | %s | %s |" % (
+                key[0], key[2],
+                "%.0f" % cc if cc is not None else "n/a",
+                "%.0f" % ffc if ffc is not None else "n/a"))
+        lines.append("")
+
+
+def main(out_dir):
+    lines = []
+    lines.append("# Benchmark summary\n")
+
+    micro = read_tsv(os.path.join(out_dir, "micro.tsv"))
+    if micro:
+        lines.append("## Microbenchmarks (median steady_us over rounds)\n")
+        lines.append("| variant | k | n | fused (ours) | app-level (ours) | eager (ours) | nojit (ours) | torch.compile | compile-ro | compile-mat | torch eager | JAX/XLA | IREE | Triton | speedup vs compile | interp tax | ours/Triton |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        groups = collections.defaultdict(lambda: collections.defaultdict(list))
+        for r in micro:
+            dtype = r.get("breaks") or r.get("graphs") or "float64"
+            key = (dtype, int(r["variant"]), int(r["k"]), int(r["n"]))
+            groups[key][r["mode"]].append(float(r["steady_us"]))
+        def row(key, g):
+            fused = med(g.get("fused", []))
+            app = med(g.get("app", []))
+            compiled = med(g.get("torch-compile", []))
+            compiled_ro = med(g.get("torch-compile-ro", []))
+            compiled_mat = med(g.get("torch-compile-mat", []))
+            speedup = compiled / fused if fused and compiled else None
+            # Interpreter cost: app-level run over the translated RPython run.
+            tax = app / fused if app and fused else None
+            triton = med(g.get("triton", []))
+            kernel_gap = fused / triton if fused and triton else None
+            return "| %d | %d | %d | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+                key[1], key[2], key[3], fmt(fused), fmt(app),
+                fmt(med(g.get("eager", []))),
+                fmt(med(g.get("nojit", []))), fmt(compiled),
+                fmt(compiled_ro), fmt(compiled_mat),
+                fmt(med(g.get("torch-eager", []))),
+                fmt(med(g.get("jax", []))), fmt(med(g.get("iree", []))),
+                fmt(triton),
+                fmt(speedup, "%.2fx") if speedup else "n/a",
+                fmt(tax, "%.2fx") if tax else "n/a",
+                fmt(kernel_gap, "%.2fx") if kernel_gap else "n/a")
+        for key in sorted(groups):
+            if key[0] == "float64":
+                lines.append(row(key, groups[key]))
+        lines.append("")
+        others = [k for k in sorted(groups) if k[0] != "float64"]
+        if others:
+            lines.append("## Precision sweep (median steady_us)\n")
+            lines.append("| dtype | variant | k | n | fused (ours) | app-level (ours) | eager (ours) | nojit (ours) | torch.compile | compile-ro | compile-mat | torch eager | JAX/XLA | IREE | Triton | speedup vs compile | interp tax | ours/Triton |")
+            lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+            for key in others:
+                lines.append("| %s %s" % (key[0], row(key, groups[key])))
+            lines.append("")
+
+        lines.append("## Guards / graph breaks (launches per iter, torch graph breaks)\n")
+        lines.append("| variant | n | launches/iter (fused) | torch graphs | torch breaks |")
+        lines.append("|---|---|---|---|---|")
+        gb = collections.defaultdict(lambda: collections.defaultdict(list))
+        for r in micro:
+            v = int(r["variant"])
+            if v < 1 or v > 5:
+                continue
+            key = (v, int(r["n"]))
+            gb[key][r["mode"]].append(r)
+        for key in sorted(gb):
+            fused_rows = gb[key].get("fused", [])
+            torch_rows = gb[key].get("torch-compile", [])
+            launches = med([x["launches_per_iter"] for x in fused_rows
+                           if x.get("launches_per_iter")])
+            graphs = torch_rows[0].get("launches_per_iter", "") if torch_rows else ""
+            breaks = torch_rows[0].get("graphs", "") if torch_rows else ""
+            lines.append("| %d | %d | %s | %s | %s |" % (
+                key[0], key[1], fmt(launches, "%.1f"), graphs, breaks))
+        lines.append("")
+
+    models = read_tsv(os.path.join(out_dir, "models.tsv"))
+    if models:
+        lines.append("## End-to-end models (median steady_us, ratio to torch.compile)\n")
+        lines.append("| model | ours | torch.compile | compile-ro | compile-mat | torch eager | JAX/XLA | IREE | TensorRT | ratio ours/compile | ratio jax/compile | launches/iter (ours) | correctness | tol | pass |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        g = collections.defaultdict(lambda: collections.defaultdict(list))
+        corr = collections.defaultdict(list)
+        tols = {}
+        verdict = collections.defaultdict(list)
+        launches = collections.defaultdict(list)
+        for r in models:
+            g[r["model"]][r["system"]].append(float(r["steady_us"]))
+            if r.get("maxabsdiff"):
+                corr[r["model"]].append(r["maxabsdiff"])
+            if r.get("tolerance"):
+                tols[r["model"]] = r["tolerance"]
+            if r.get("pass") not in (None, ""):
+                verdict[r["model"]].append(r["pass"])
+            if r["system"] == "ours" and r.get("launches_per_iter"):
+                launches[r["model"]].append(float(r["launches_per_iter"]))
+        for model in sorted(g):
+            ours = med(g[model].get("ours", []))
+            compiled = med(g[model].get("torch-compile", []))
+            compiled_ro = med(g[model].get("torch-compile-ro", []))
+            compiled_mat = med(g[model].get("torch-compile-mat", []))
+            eager = med(g[model].get("torch-eager", []))
+            ratio = ours / compiled if ours and compiled else None
+            jax_ = med(g[model].get("jax", []))
+            iree = med(g[model].get("iree", []))
+            jratio = jax_ / compiled if jax_ and compiled else None
+            c = corr.get(model, [])
+            cstr = c[0] if c else ""
+            v = verdict.get(model, [])
+            # One failing system fails the model.
+            vstr = "" if not v else ("pass" if all(x == "1" for x in v)
+                                     else "FAIL")
+            lines.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+                model, fmt(ours), fmt(compiled), fmt(compiled_ro), fmt(compiled_mat),
+                fmt(eager), fmt(jax_),
+                fmt(iree), fmt(med(g[model].get("torch-tensorrt", []))),
+                fmt(ratio, "%.2fx") if ratio else "n/a",
+                fmt(jratio, "%.2fx") if jratio else "n/a",
+                fmt(med(launches.get(model, [])), "%.1f"),
+                cstr, tols.get(model, ""), vstr))
+        lines.append("")
+
+    correctness = read_tsv(os.path.join(out_dir, "correctness.tsv"))
+    if correctness:
+        # Worst of the five inputs, never the average.
+        lines.append("## Correctness on five derived inputs "
+                     "(worst case per model; ours is the reference)\n")
+        lines.append("| model | system | max maxabsdiff | min argmax match "
+                     "| tol | passed |")
+        lines.append("|---|---|---|---|---|---|")
+        c = collections.defaultdict(list)
+        for r in correctness:
+            if r.get("system") == "ours" or not r.get("maxabsdiff"):
+                continue
+            c[(r["model"], r["system"])].append(r)
+        for key in sorted(c):
+            rs = c[key]
+            diffs = [float(r["maxabsdiff"]) for r in rs if r["maxabsdiff"]]
+            match = [float(r["argmax_match"]) for r in rs
+                     if r.get("argmax_match")]
+            passes = [r.get("pass") for r in rs if r.get("pass") not in (None, "")]
+            tol = next((r["tol"] for r in rs if r.get("tol")), "")
+            lines.append("| %s | %s | %s | %s | %s | %d/%d |" % (
+                key[0], key[1],
+                fmt(max(diffs) if diffs else None, "%.3g"),
+                fmt(min(match) if match else None, "%.3f"), tol,
+                sum(1 for x in passes if x == "1"), len(rs)))
+        lines.append("")
+
+    batch = read_tsv(os.path.join(out_dir, "batch.tsv"))
+    if batch:
+        # steady_us is per forward; per_seq_us is steady/B. "rows identical":
+        # B copies of one sequence must give B identical output row blocks.
+        lines.append("## Batch-size sweep "
+                     "(median steady_us per forward; per_seq = steady/B)\n")
+        lines.append("| model | batch | ours | torch.compile | compile-ro "
+                     "| torch eager | JAX/XLA | ratio ours/compile "
+                     "| ratio ours/jax | per_seq ours | per_seq compile "
+                     "| per_seq jax | rows identical | failed |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        st = collections.defaultdict(list)
+        ps = collections.defaultdict(list)
+        ident = collections.defaultdict(list)
+        failed = collections.defaultdict(list)
+        for r in batch:
+            key = (r["model"], int(r["batch"]), r["system"])
+            if (r.get("status") or "ok") != "ok" or not r.get("steady_us"):
+                failed[(r["model"], int(r["batch"]))].append(r["system"])
+                continue
+            st[key].append(float(r["steady_us"]))
+            if r.get("per_seq_us"):
+                ps[key].append(float(r["per_seq_us"]))
+            if r.get("batch_rows_identical") not in (None, ""):
+                ident[(r["model"], int(r["batch"]))].append(
+                    r["batch_rows_identical"])
+        for model, b in sorted({(k[0], k[1]) for k in st}
+                               | set(failed)):
+            def v(system, table=st):
+                return med(table.get((model, b, system), []))
+            ours, comp = v("ours"), v("torch-compile")
+            jx = v("jax")
+            marks = ident.get((model, b), [])
+            miss = sorted(set(failed.get((model, b), [])))
+            lines.append("| %s | %d | %s | %s | %s | %s | %s | %s | %s | %s "
+                         "| %s | %s | %s | %s |" % (
+                model, b, fmt(ours), fmt(comp), fmt(v("torch-compile-ro")),
+                fmt(v("torch-eager")), fmt(jx),
+                fmt(ours / comp, "%.2fx") if ours and comp else "n/a",
+                fmt(ours / jx, "%.2fx") if ours and jx else "n/a",
+                fmt(v("ours", ps)), fmt(v("torch-compile", ps)),
+                fmt(v("jax", ps)),
+                "" if not marks else ("yes" if all(x == "1" for x in marks)
+                                      else "NO"),
+                ",".join(miss)))
+        lines.append("")
+
+    ablation = read_tsv(os.path.join(out_dir, "ablation.tsv"))
+    if ablation:
+        lines.append("## Ablations (median steady_us)\n")
+        lines.append("| experiment | variant | model | steady_us | launches/iter | note |")
+        lines.append("|---|---|---|---|---|---|")
+        g = collections.defaultdict(list)
+        launches = collections.defaultdict(list)
+        notes = {}
+        for r in ablation:
+            key = (r["experiment"], r["variant"], r["model"])
+            if r.get("steady_us"):
+                g[key].append(float(r["steady_us"]))
+            if r.get("launches_per_iter"):
+                launches[key].append(float(r["launches_per_iter"]))
+            if r.get("note"):
+                notes[key] = r["note"]
+        for key in sorted(g) if g else sorted(notes):
+            steady = med(g.get(key, []))
+            lines.append("| %s | %s | %s | %s | %s | %s |" % (
+                key[0], key[1], key[2], fmt(steady),
+                fmt(med(launches.get(key, [])), "%.1f"), notes.get(key, "")))
+        for key in sorted(notes):
+            if key not in g:
+                lines.append("| %s | %s | %s | %s | %s | %s |" % (
+                    key[0], key[1], key[2], "n/a", "", notes[key]))
+        lines.append("")
+
+    deopt = read_tsv(os.path.join(out_dir, "deopt.tsv"))
+    if deopt:
+        # first_fail/after_fail/peak are single iterations, not loop medians.
+        lines.append("## Deoptimization cost "
+                     "(median over rounds, us per iteration)\n")
+        lines.append("| system | pattern | steady_us | first_fail_us "
+                     "| after_fail_us | peak_us | cold_us | launches/it "
+                     "| loops | bridges |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|")
+        g = collections.defaultdict(lambda: collections.defaultdict(list))
+        order = ["never", "alternate", "both-hot", "fresh", "probe-a",
+                 "probe-e"]
+        for r in deopt:
+            for col in ("steady_us", "first_fail_us", "after_fail_us",
+                        "peak_us", "cold_us", "launches_per_iter", "loops",
+                        "bridges"):
+                if r.get(col) not in (None, ""):
+                    g[(r["pattern"], r["system"])][col].append(float(r[col]))
+
+        def cell(d, col, spec="%.0f"):
+            v = med(d.get(col, []))
+            return fmt(v, spec) if v is not None and v >= 0 else "n/a"
+
+        for key in sorted(g, key=lambda k: (order.index(k[0])
+                                            if k[0] in order else 99, k[1])):
+            d = g[key]
+            lines.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |"
+                         % (key[1], key[0], cell(d, "steady_us", "%.1f"),
+                            cell(d, "first_fail_us"), cell(d, "after_fail_us"),
+                            cell(d, "peak_us"), cell(d, "cold_us"),
+                            cell(d, "launches_per_iter", "%.2f"),
+                            cell(d, "loops"), cell(d, "bridges")))
+        lines.append("")
+
+    records = read_jsonl(os.path.join(out_dir, "results.jsonl"))
+    compile_table(records, lines)
+    warmup_table(records, lines)
+
+    dsum = read_tsv(os.path.join(out_dir, "dynamic_summary.tsv"))
+    if dsum:
+        # Pass 1 is the first visit of each length, pass 2 the revisit.
+        # Counters are deltas inside that length's window.
+        lines.append("## Dynamic sequence length "
+                     "(median steady_us per length, counters per window)\n")
+        lines.append("| system | pass | length | median_us | total_us | loops "
+                     "| bridges | kernels | cache_hits | recompiles |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|")
+        g = collections.defaultdict(list)
+        for r in dsum:
+            g[(r["system"], r.get("pass", "1"), r["length"])].append(r)
+
+        def d(rows, col):
+            vs = [float(x[col]) for x in rows if x.get(col) not in (None, "")]
+            return "%.0f" % med(vs) if vs else ""
+
+        for key in sorted(g, key=lambda k: (k[0], k[1], int(k[2]))):
+            rows = g[key]
+            lines.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+                key[0], key[1], key[2],
+                fmt(med([x["median_us"] for x in rows])),
+                fmt(med([x["total_us"] for x in rows])) if rows[0].get("total_us") else "",
+                d(rows, "loops"), d(rows, "bridges"), d(rows, "kernels"),
+                d(rows, "cache_hits"), d(rows, "new_graphs")))
+        lines.append("")
+
+    lazy = read_tsv(os.path.join(out_dir, "lazy.tsv"))
+    if lazy:
+        # Equal kernel and compile counts on virtual and deferred arms mean
+        # both ran the same kernels.
+        lines.append("## Where the operation DAG lives (median over rounds)\n")
+        lines.append("| model | DAG in | steady_us | launches/iter | kernels | "
+                     "compiles | gc_ms | nodes deferred | same argmax |")
+        lines.append("|---|---|---|---|---|---|---|---|---|")
+        g = collections.defaultdict(list)
+        for r in lazy:
+            g[(r["model"], r["system"])].append(r)
+        order = {"virtual": 0, "deferred": 1, "eager": 2}
+        for key in sorted(g, key=lambda k: (k[0], order.get(k[1], 9))):
+            rows = g[key]
+            col = lambda c, spec="%.1f": fmt(med([x[c] for x in rows
+                                                  if x.get(c) not in (None, "")]), spec)
+            lines.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+                key[0], key[1], col("steady_us"), col("launches_per_iter"),
+                col("kernels", "%.0f"), col("compiles", "%.0f"),
+                col("gc_ms", "%.0f"), col("lazy_nodes", "%.0f"),
+                rows[0].get("argmax_match", "")))
+        lines.append("")
+
+    lazy_micro = read_tsv(os.path.join(out_dir, "lazy_micro.tsv"))
+    if lazy_micro:
+        lines.append("## Where the DAG lives, micro grid (median over rounds)\n")
+        lines.append("| variant | k | n | DAG in | steady_us | launches/iter |")
+        lines.append("|---|---|---|---|---|---|")
+        g = collections.defaultdict(list)
+        for r in lazy_micro:
+            g[(int(r["variant"]), int(r["k"]), int(r["n"]), r["system"])].append(r)
+        order = {"virtual": 0, "deferred": 1, "eager": 2}
+        for key in sorted(g, key=lambda k: (k[0], k[1], k[2], order.get(k[3], 9))):
+            rows = g[key]
+            lines.append("| %d | %d | %d | %s | %s | %s |" % (
+                key[0], key[1], key[2], key[3],
+                fmt(med([x["steady_us"] for x in rows])),
+                fmt(med([x["launches_per_iter"] for x in rows]), "%.2f")))
+        lines.append("")
+
+    control = read_tsv(os.path.join(out_dir, "control.tsv"))
+    if control:
+        # total_ms includes compilation. The exit sequence must match across systems.
+        lines.append("## Host-dependent early exit (median over rounds)\n")
+        lines.append("| regime | system | total_ms | p50_us | p95_us | max_us | "
+                     "bridges | frame_compiles | exit layers | pass |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|")
+        g = collections.defaultdict(list)
+        for r in control:
+            g[(r["regime"], r["system"])].append(r)
+        for key in sorted(g):
+            rows = g[key]
+            col = lambda c, spec="%.1f": fmt(med([x[c] for x in rows
+                                                  if x.get(c) not in (None, "")]), spec)
+            lines.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+                key[0], key[1], col("total_ms", "%.0f"), col("p50_us"),
+                col("p95_us"), col("max_us", "%.0f"), col("bridges", "%.0f"),
+                col("frame_compiles", "%.0f"), rows[0].get("exit_seq", ""),
+                rows[0].get("pass", "")))
+        lines.append("")
+
+    decode = read_tsv(os.path.join(out_dir, "decode.tsv"))
+    if decode:
+        # One row per process, already the median token of its warm generations.
+        lines.append("## Next-token latency, greedy decode with a KV cache "
+                     "(median over processes)\n")
+        lines.append("| model | system | us/token | p90 us | launches/token | "
+                     "tokens match | teacher-forced |")
+        lines.append("|---|---|---|---|---|---|---|")
+        g = collections.OrderedDict()
+        for r in decode:
+            g.setdefault((r["model"], r["system"]), []).append(r)
+        for key, rows in g.items():
+            col = lambda c, spec="%.1f": fmt(med([x[c] for x in rows
+                                                  if x.get(c) not in (None, "")]), spec)
+            lines.append("| %s | %s | %s | %s | %s | %d/%d | %s |" % (
+                key[0], key[1], col("token_us", "%.0f"), col("p90_us", "%.0f"),
+                col("launches_per_token", "%.2f"),
+                sum(x.get("tokens_match") == "1" for x in rows), len(rows),
+                rows[0].get("teacher_forced") or "-"))
+        lines.append("")
+
+    trans = read_tsv(os.path.join(out_dir, "transition.tsv"))
+    if trans:
+        lines.append("## Carrying a fused value across a guard: descriptor "
+                     "kept (direct) against drained (median over rounds)\n")
+        lines.append("| cache | shape | arm | before us | at us | after us | "
+                     "total ms | launches | kernels |")
+        lines.append("|---|---|---|---|---|---|---|---|---|")
+        g = collections.defaultdict(list)
+        for r in trans:
+            g[(r["cache"], "%sx%s" % (r["rows"], r["cols"]), r["arm"])].append(r)
+        for key in sorted(g):
+            rows = g[key]
+            col = lambda c, spec="%.1f": fmt(med([x[c] for x in rows
+                                                  if x.get(c) not in (None, "")]), spec)
+            lines.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+                key[0], key[1], key[2], col("before_us"), col("at_us"),
+                col("after_us"), col("total_ms"), col("launches", "%.0f"),
+                col("kernels", "%.0f")))
+        lines.append("")
+
+    suites = read_tsv(os.path.join(out_dir, "suites.tsv"))
+    if suites:
+        # ours is a failed row (no time) unless every run passed the accuracy
+        # check with no CPU fallback.
+        lines.append("## PyTorch 2 benchmark suites, as the inductor dashboard "
+                     "runs them (median ms per forward, median over "
+                     "processes)\n")
+        g = collections.OrderedDict()
+        for r in suites:
+            g.setdefault((r["suite"], r["model"]), {}).setdefault(
+                r["system"], []).append(r)
+        has_jax = any("jax-xla" in s for s in g.values())
+        lines.append("| suite | model | batch | ours | torch eager | inductor "
+                     "| inductor+cg | ours/inductor | ours/best | launches | "
+                     "accuracy |" + (" jax-xla | ours/jax-xla | jax-xla "
+                                     "accuracy |" if has_jax else ""))
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|" +
+                     ("---|---|---|" if has_jax else ""))
+        for (suite, model), systems in g.items():
+            ours = systems.get("ours", [])
+            good = [x for x in ours if x.get("pass") == "1" and
+                    x.get("cpu_fallback") == "0"]
+            t = lambda sysname: med([x["median_ms"] for x in
+                                     systems.get(sysname, [])
+                                     if x.get("median_ms")])
+            o = med([x["median_ms"] for x in good]) if ours and \
+                len(good) == len(ours) else None
+            ind, cg, eager = t("torch-inductor"), t("torch-inductor-cg"), \
+                t("torch-eager")
+            best = min([v for v in (eager, ind, cg) if v is not None] or
+                       [None]) if any((eager, ind, cg)) else None
+            batch = (ours or systems.get("torch-eager", [{}]))[0].get("batch",
+                                                                       "")
+            row = "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+                suite, model, batch, fmt(o, "%.3f"), fmt(eager, "%.3f"),
+                fmt(ind, "%.3f"), fmt(cg, "%.3f"),
+                fmt(o / ind if o and ind else None, "%.2fx"),
+                fmt(o / best if o and best else None, "%.2fx"),
+                fmt(med([x["launches"] for x in good]), "%.0f"),
+                "%d/%d" % (len(good), len(ours)))
+            if has_jax:
+                jax = systems.get("jax-xla", [])
+                jgood = [x for x in jax if x.get("median_ms") and
+                         x.get("pass") == "1"]
+                j = med([x["median_ms"] for x in jgood]) if jax and \
+                    len(jgood) == len(jax) else None
+                row += " %s | %s | %d/%d |" % (
+                    fmt(j, "%.3f"), fmt(o / j if o and j else None, "%.2fx"),
+                    len(jgood), len(jax))
+            lines.append(row)
+        lines.append("")
+
+    text = "\n".join(lines) + "\n"
+    out_path = os.path.join(out_dir, "summary.md")
+    with open(out_path, "w") as f:
+        f.write(text)
+    print(text)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1] if len(sys.argv) > 1 else ".")

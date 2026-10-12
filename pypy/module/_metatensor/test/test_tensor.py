@@ -1,0 +1,805 @@
+import os
+os.environ.setdefault('RTENSOR_CPU', '1')
+
+
+class AppTestTensor(object):
+    spaceconfig = dict(usemodules=['_metatensor', 'struct'])
+
+    def setup_class(cls):
+        from rpython.tool.udir import udir
+        cls.w_tmpfile = cls.space.wrap(str(udir.join('metatensor_tofile')))
+
+    def test_construct(self):
+        import _metatensor
+        t = _metatensor.tensor([1.0, 2.0, 3.0])
+        assert t.shape == (3,)
+        assert t.size == 3
+        assert t.requires_grad is False
+        m = _metatensor.tensor([[1.0, 2.0], [3.0, 4.0]])
+        assert m.shape == (2, 2)
+
+    def test_zeros(self):
+        import _metatensor
+        z = _metatensor.zeros([2, 3])
+        assert z.shape == (2, 3)
+        assert z.sum().item() == 0.0
+
+    def test_add_mul_broadcast(self):
+        import _metatensor
+        a = _metatensor.tensor([1.0, 2.0, 3.0])
+        b = _metatensor.tensor([10.0])
+        c = a.add(b)
+        assert c.sum().item() == 36.0
+        d = a.mul(_metatensor.tensor([2.0]))
+        assert d.sum().item() == 12.0
+        e = a + b
+        assert e.sum().item() == 36.0
+
+    def test_sum_axis(self):
+        import _metatensor
+        m = _metatensor.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        assert m.sum().item() == 21.0
+        s0 = m.sum(0)
+        w0 = _metatensor.tensor([1.0, 2.0, 3.0])
+        assert s0.mul(w0).sum().item() == 46.0
+        s1 = m.sum(1)
+        w1 = _metatensor.tensor([1.0, 2.0])
+        assert s1.mul(w1).sum().item() == 36.0
+
+    def test_matmul(self):
+        import _metatensor
+        x = _metatensor.tensor([[1.0, 2.0], [3.0, 4.0]])
+        w = _metatensor.tensor([[1.0, 0.0], [0.0, 1.0]])
+        y = x.matmul(w)
+        assert y.sum().item() == 10.0
+
+    def test_reshape(self):
+        import _metatensor
+        t = _metatensor.tensor([1.0, 2.0, 3.0, 4.0])
+        r = t.reshape([2, 2])
+        assert r.shape == (2, 2)
+        assert r.sum().item() == 10.0
+
+    def test_shape_mismatch(self):
+        import _metatensor
+        a = _metatensor.tensor([1.0, 2.0, 3.0])
+        b = _metatensor.tensor([1.0, 2.0])
+        raises(ValueError, a.add, b)
+        raises(ValueError, a.reshape, [3, 3])
+
+    def test_add__inplace_updates_view(self):
+        import _metatensor
+        t = _metatensor.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        v = t.reshape([2, 3])
+        b = _metatensor.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+        r = t.add_(b)
+        assert r is t
+        assert v.sum().item() == 27.0
+
+    def test_add__on_requires_grad_leaf_raises(self):
+        import _metatensor
+        a = _metatensor.tensor([1.0, 2.0], requires_grad=True)
+        b = _metatensor.tensor([0.5, 0.5])
+        raises(ValueError, a.add_, b)
+        raises(ValueError, a.mul_, b)
+
+    def test_backward(self):
+        import _metatensor
+        x = _metatensor.tensor([1.0, -2.0, 3.0], requires_grad=True)
+        w = _metatensor.tensor([2.0, 1.0, -1.0], requires_grad=True)
+        b = _metatensor.tensor([0.5, 0.5, 0.5], requires_grad=True)
+        z = x.mul(w).add(b).relu()
+        loss = z.sum()
+        assert loss.item() == 2.5
+        assert x.grad is None
+        loss.backward()
+        assert x.grad.sum().item() == 2.0
+        assert w.grad.sum().item() == 1.0
+        assert b.grad.sum().item() == 1.0
+
+    def test_mlp_training_step(self):
+        import _metatensor
+        from tensorpypy import nn
+        from tensorpypy.models import MLP
+        from tensorpypy import optim
+
+        w1 = _metatensor.tensor([[1.0, -1.0], [0.5, 0.5]], requires_grad=True)
+        b1 = _metatensor.tensor([0.0, 0.0], requires_grad=True)
+        w2 = _metatensor.tensor([[1.0], [1.0]], requires_grad=True)
+        b2 = _metatensor.tensor([0.0], requires_grad=True)
+        mlp = MLP([nn.Linear(w1, b1),
+                               nn.Linear(w2, b2)])
+        x = _metatensor.tensor([[1.0, 2.0]])
+        target = _metatensor.tensor([[0.0]])
+
+        def loss_fn():
+            y = mlp(x)
+            d = y.add(target.mul(_metatensor.tensor([-1.0])))
+            return d.mul(d).sum()
+
+        loss0 = loss_fn().item()
+        for i in range(5):
+            loss = loss_fn()
+            loss.backward()
+            optim.sgd_step(mlp.parameters(), 0.05)
+        loss1 = loss_fn().item()
+        assert loss1 < loss0
+
+    def test_sub_div_exp_sqrt_max(self):
+        import _metatensor
+        a = _metatensor.tensor([1.0, 4.0, 9.0])
+        b = _metatensor.tensor([1.0, 2.0, 3.0])
+        assert a.sub(b).sum().item() == 8.0
+        assert (a - b).sum().item() == 8.0
+        assert a.div(b).sum().item() == 6.0
+        assert (a / b).sum().item() == 6.0
+        assert a.sqrt().sum().item() == 6.0
+        assert abs(b.exp().sum().item() - 30.19287485057736) < 1e-12
+        assert a.max().item() == 9.0
+        m = _metatensor.tensor([[1.0, 5.0], [7.0, 2.0]])
+        assert m.max(1).sum().item() == 12.0
+        assert m.max(0).sum().item() == 12.0
+
+    def test_unary_binary_where(self):
+        import _metatensor, math
+        xs = [-2.0, -0.5, 0.0, 0.5, 2.0]
+        x = _metatensor.tensor(xs)
+        y = x.unary('tanh').tolist()
+        assert max([abs(y[i] - math.tanh(xs[i])) for i in range(5)]) < 1e-15
+        y = x.unary('sigmoid').tolist()
+        assert abs(y[4] - 1.0 / (1.0 + math.exp(-2.0))) < 1e-15
+        assert x.unary('abs').tolist() == [2.0, 0.5, 0.0, 0.5, 2.0]
+        assert x.unary('neg').tolist() == [2.0, 0.5, -0.0, -0.5, -2.0]
+        assert x.binary('gt', 0.0).tolist() == [0.0, 0.0, 0.0, 1.0, 1.0]
+        assert x.binary('ne', x).tolist() == [0.0] * 5
+        assert x.binary('pow', 2.0).tolist() == [4.0, 0.25, 0.0, 0.25, 4.0]
+        assert x.binary('maximum', 0.25).tolist() == [0.25, 0.25, 0.25,
+                                                       0.5, 2.0]
+        m = _metatensor.tensor([[1.0, 2.0], [3.0, 4.0]])
+        row = _metatensor.tensor([2.0, 2.0])
+        assert m.binary('minimum', row).tolist() == [1.0, 2.0, 2.0, 2.0]
+        c = x.binary('gt', 0.0)
+        w = c.where(x.unary('log'), 0.0)
+        assert w.tolist() == [0.0, 0.0, 0.0, math.log(0.5), math.log(2.0)]
+        assert c.where(1.0, x).tolist() == [-2.0, -0.5, 0.0, 1.0, 1.0]
+        f = _metatensor.tensor(xs, dtype="float32")
+        assert f.unary('erf').dtype == "float32"
+        assert abs(f.unary('erf').tolist()[4] - math.erf(2.0)) < 1e-6
+        raises(ValueError, x.unary, 'tan')
+        raises(ValueError, x.binary, 'atan2', x)
+        raises(ValueError, x.binary, 'pow', f)
+        raises(ValueError, x.binary, 'pow', _metatensor.tensor([1.0, 2.0]))
+
+    def test_matmul_transpose_b(self):
+        import _metatensor
+        x = _metatensor.tensor([[1.0, 2.0], [3.0, 4.0]])
+        w = _metatensor.tensor([[1.0, 10.0], [100.0, 1000.0]])
+        assert x.matmul(w, True).sum().item() == 6464.0
+
+    def test_matmul_bias(self):
+        import _metatensor
+        x = _metatensor._tensor_flat([1.0, 2.0, 3.0, 4.0], [2, 2], False,
+                                     'float32')
+        w = _metatensor._tensor_flat([1.0, 0.0, 2.0, 1.0], [2, 2], False,
+                                     'float32')
+        b = _metatensor._tensor_flat([10.0, 20.0], [2], False, 'float32')
+        assert x.matmul_bias(w, False, False, b).tolist() == [
+            15.0, 22.0, 21.0, 24.0]
+        assert x.matmul_bias(w, True, False, b).tolist() == [
+            11.0, 24.0, 13.0, 30.0]
+        d = _metatensor.tensor([[1.0, 2.0], [3.0, 4.0]])
+        raises(ValueError, d.matmul_bias, d, False, False,
+               _metatensor.tensor([1.0, 2.0]))
+        raises(ValueError, x.matmul_bias, w, False, False, w)
+
+    def test_explicit_broadcast(self):
+        import _metatensor
+        m = _metatensor.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        s = m.sum(1)
+        assert m.sub_bc(s, 5).tolist() == [-5.0, -4.0, -3.0, -11.0, -10.0,
+                                          -9.0]
+        assert s.sub_bc(m, 6).tolist() == [5.0, 4.0, 3.0, 11.0, 10.0, 9.0]
+        r = _metatensor.tensor([1.0, 10.0, 100.0])
+        assert m.mul_bc(r, 1).tolist() == [1.0, 20.0, 300.0, 4.0, 50.0,
+                                          600.0]
+        assert m.div_bc(2.0, 2).tolist() == [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+        assert m.add_bc(r, -1).tolist() == m.add(r).tolist()
+        assert m.binary_bc("maximum", s, 5).tolist() == [6.0] * 3 + [15.0] * 3
+
+    def test_logsumexp_log_softmax(self):
+        import _metatensor, math
+        m = _metatensor.tensor([[1.0, 2.0, 3.0], [0.0, 0.0, 0.0]])
+        lse = m.logsumexp().tolist()
+        want = [3.0 + math.log(math.exp(-2.0) + math.exp(-1.0) + 1.0),
+                math.log(3.0)]
+        assert abs(lse[0] - want[0]) < 1e-12 and abs(lse[1] - want[1]) < 1e-12
+        ls = m.log_softmax().tolist()
+        rows = [[1.0, 2.0, 3.0], [0.0, 0.0, 0.0]]
+        for i in range(2):
+            for j in range(3):
+                assert abs(ls[3 * i + j] - (rows[i][j] - want[i])) < 1e-12
+
+    def test_softmax_layernorm(self):
+        import _metatensor, math
+        from tensorpypy.functional import softmax, layer_norm
+        x = _metatensor.tensor([[1.0, 2.0, 3.0], [1.0, 1.0, 1.0]])
+        s = softmax(x)
+        assert abs(s.sum().item() - 2.0) < 1e-12
+        e = [math.exp(v - 3.0) for v in [1.0, 2.0, 3.0]]
+        tot = sum(e)
+        pick = _metatensor.tensor([[1.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+        assert abs(s.mul(pick).sum().item() - e[0] / tot) < 1e-12
+        one = _metatensor.tensor([1.0, 1.0, 1.0])
+        zero = _metatensor.tensor([0.0, 0.0, 0.0])
+        y = layer_norm(x, one, zero)
+        assert abs(y.sum().item()) < 1e-9
+        std = math.sqrt(2.0 / 3.0)
+        assert abs(y.mul(pick).sum().item() + 1.0 / std) < 1e-4
+
+    def test_cnn_forward(self):
+        import _metatensor, math
+        from tensorpypy import nn
+        from tensorpypy.models import CNN
+        C, H, W, O, NC = 2, 4, 4, 3, 5
+        fan = C * 9
+        feat = O * (H // 2) * (W // 2)
+        wc = [float((i * 7) % 13 - 6) / fan for i in range(fan * O)]
+        wf = [float((i * 7) % 13 - 6) / feat for i in range(feat * NC)]
+        x = [float(i % 5) - 2.0 for i in range(C * H * W)]
+        cnn = CNN(
+            nn.Conv2d(_metatensor.tensor(wc).reshape([fan, O]),
+                              _metatensor.tensor([0.01] * O), C, H, W),
+            nn.BatchNorm2d(O),
+            nn.MaxPool2d(O, H, W),
+            nn.Linear(_metatensor.tensor(wf).reshape([feat, NC]),
+                              _metatensor.tensor([0.01] * NC)))
+        y = cnn(_metatensor.tensor(x).reshape([1, C * H * W]))
+        assert y.shape == (1, NC)
+
+        def at(c, h, w):
+            if 0 <= h < H and 0 <= w < W:
+                return x[c * H * W + h * W + w]
+            return 0.0
+
+        inv = 1.0 / math.sqrt(1.0 + 1e-5)
+        planes = []
+        for o in range(O):
+            plane = []
+            for h in range(H):
+                row = []
+                for w in range(W):
+                    acc = 0.01
+                    for c in range(C):
+                        for r in range(3):
+                            for s in range(3):
+                                acc += (at(c, h + r - 1, w + s - 1) *
+                                        wc[(c * 9 + r * 3 + s) * O + o])
+                    row.append(max(acc * inv, 0.0))
+                plane.append(row)
+            planes.append(plane)
+        flat = []
+        for o in range(O):
+            for oh in range(H // 2):
+                for ow in range(W // 2):
+                    p = planes[o]
+                    flat.append(max(p[2 * oh][2 * ow], p[2 * oh][2 * ow + 1],
+                                    p[2 * oh + 1][2 * ow],
+                                    p[2 * oh + 1][2 * ow + 1]))
+        exp = 0.0
+        for j in range(NC):
+            acc = 0.01
+            for i in range(feat):
+                acc += flat[i] * wf[i * NC + j]
+            exp += max(acc, 0.0)
+        assert abs(y.sum().item() - exp) < 1e-9
+
+    def test_backward_new_ops(self):
+        import _metatensor, math
+        x = _metatensor.tensor([1.0, 4.0, 9.0], requires_grad=True)
+        x.sqrt().sum().backward()
+        assert abs(x.grad.sum().item() - (0.5 + 0.25 + 1.0 / 6.0)) < 1e-12
+
+        e = _metatensor.tensor([0.0, 1.0], requires_grad=True)
+        e.exp().sum().backward()
+        assert abs(e.grad.sum().item() - (1.0 + math.e)) < 1e-12
+
+        a = _metatensor.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+        b = _metatensor.tensor([2.0], requires_grad=True)
+        a.div(b).sum().backward()
+        assert abs(a.grad.sum().item() - 2.0) < 1e-12
+        assert abs(b.grad.sum().item() + 2.5) < 1e-12
+
+        s = _metatensor.tensor([[1.0, 2.0]], requires_grad=True)
+        t = _metatensor.tensor([[0.25, 0.5]], requires_grad=True)
+        s.sub(t).sum().backward()
+        assert s.grad.sum().item() == 2.0
+        assert t.grad.sum().item() == -2.0
+
+        m = _metatensor.tensor([[1.0, 5.0], [7.0, 2.0]], requires_grad=True)
+        m.max(1).sum().backward()
+        assert m.grad.sum().item() == 2.0
+
+        p = _metatensor.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+        q = _metatensor.tensor([[1.0, 10.0], [100.0, 1000.0]])
+        p.matmul(q, True).sum().backward()
+        assert p.grad.sum().item() == 2222.0
+
+        h = _metatensor.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
+                           requires_grad=True)
+        h.head_split(2).head_merge(2).sum().backward()
+        assert h.grad.sum().item() == 8.0
+
+        u = _metatensor.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+        eye = _metatensor.tensor([[1.0, 0.0], [0.0, 1.0]])
+        u.bmm(eye, 1).sum().backward()
+        assert u.grad.sum().item() == 4.0
+
+    def test_backward_softmax_rows(self):
+        import _metatensor
+        from tensorpypy.functional import softmax
+        x = _metatensor.tensor([[1.0, 2.0, 3.0], [0.5, -1.0, 2.5]],
+                           requires_grad=True)
+        w = _metatensor.tensor([[1.0, -2.0, 0.5], [0.25, 1.5, -1.0]])
+        softmax(x).mul(w).sum().backward()
+        g = x.grad
+        rows = g.mul(_metatensor.tensor([1.0, 1.0, 1.0])).sum(1)
+        assert abs(rows.mul(_metatensor.tensor([1.0, 1.0])).sum().item()) < 1e-12
+
+    def test_dtype_and_astype(self):
+        import _metatensor
+        a = _metatensor.tensor([1.0, 2.0, 3.0])
+        assert a.dtype == "float64"
+        b = _metatensor.tensor([1.0, 2.0, 3.0], dtype="float32")
+        assert b.dtype == "float32"
+        assert abs(b.sum().item() - 6.0) < 1e-4
+        c = b.astype("float64")
+        assert c.dtype == "float64"
+        assert abs(c.sum().item() - 6.0) < 1e-9
+        h = a.astype("float16")
+        assert h.dtype == "float16"
+        assert h.shape == (3,)
+        z = _metatensor.zeros([2, 2], False, "float32")
+        assert z.dtype == "float32"
+        raises(ValueError, _metatensor.tensor, [1.0], None, False, "float8")
+        raises(ValueError, b.add, a)
+
+    def test_gelu(self):
+        import _metatensor, math
+        from tensorpypy.functional import gelu
+        x = _metatensor.tensor([-2.0, -0.5, 0.0, 0.5, 2.0])
+        y = gelu(x)
+        want = 0.0
+        for v in [-2.0, -0.5, 0.0, 0.5, 2.0]:
+            z = math.sqrt(2.0 / math.pi) * (v + 0.044715 * v ** 3)
+            want += 0.5 * v * (1.0 + math.tanh(z))
+        assert abs(y.sum().item() - want) < 1e-9
+
+    def test_gpt2_causal(self):
+        import _metatensor
+        from tensorpypy.models import CausalSelfAttention, GPT2MLP, GPT2Block, GPT2
+        v, d, h, t = 4, 4, 2, 3
+
+        def mat(rows, cols, k):
+            data = [float(((i * k) % 7) - 3) / 8.0 for i in range(rows * cols)]
+            return _metatensor.tensor(data, [rows, cols])
+
+        def vec(n, val):
+            return _metatensor.tensor([val] * n)
+
+        mask = [0.0] * (h * t * t)
+        for head in range(h):
+            for i in range(t):
+                for j in range(i + 1, t):
+                    mask[(head * t + i) * t + j] = -1e9
+        mask = _metatensor.tensor(mask, [h * t, t])
+        wqkv = []
+        for r in range(d):
+            for k in [3, 5, 2]:
+                wqkv.extend([float(((i * k) % 7) - 3) / 8.0
+                             for i in range(r * d, (r + 1) * d)])
+        attn = CausalSelfAttention(
+            _metatensor.tensor(wqkv, [d, 3 * d]), vec(3 * d, 0.0),
+            mat(d, d, 4), vec(d, 0.0), h, mask)
+        mlp = GPT2MLP(mat(d, 4 * d, 3), vec(4 * d, 0.0),
+                                 mat(4 * d, d, 5), vec(d, 0.0))
+        block = GPT2Block(attn, vec(d, 1.0), vec(d, 0.0),
+                                     vec(d, 1.0), vec(d, 0.0), mlp)
+        model = GPT2(mat(v, d, 3), [block], vec(d, 1.0),
+                                vec(d, 0.0))
+        pos = mat(t, d, 7)
+        pick = _metatensor.tensor([1.0] + [0.0] * (t * v - 1), [t, v])
+
+        def run(last):
+            idx = _metatensor.tensor([1.0, 2.0, float(last)])
+            return model(idx, pos)
+
+        a = run(0)
+        b = run(3)
+        assert a.shape == (t, v)
+        assert abs(a.mul(pick).sum().item() -
+                   b.mul(pick).sum().item()) < 1e-12
+        assert abs(a.sum().item() - b.sum().item()) > 1e-9
+
+    def test_attn_strided_slices(self):
+        import _metatensor
+        rows, d, h = 3, 4, 2
+
+        def gen(k):
+            return [float(((i * k) % 11) - 5) / 8.0 for i in range(rows * d)]
+
+        q, k, v = gen(3), gen(5), gen(2)
+        fused = []
+        for r in range(rows):
+            for part in (q, k, v):
+                fused.extend(part[r * d:(r + 1) * d])
+        qkv = _metatensor.tensor(fused, [rows, 3 * d])
+        qt = _metatensor.tensor(q, [rows, d])
+        kt = _metatensor.tensor(k, [rows, d])
+        vt = _metatensor.tensor(v, [rows, d])
+        s0 = qt.attn_scores(kt, h).tolist()
+        s1 = qkv.attn_scores(qkv, h, d, 0, d).tolist()
+        assert len(s0) == len(s1)
+        for a, b in zip(s0, s1):
+            assert abs(a - b) < 1e-9
+        p0 = _metatensor.tensor(s0, [h * rows, rows])
+        c0 = p0.attn_context(vt, h).tolist()
+        c1 = p0.attn_context(qkv, h, d, 2 * d).tolist()
+        for a, b in zip(c0, c1):
+            assert abs(a - b) < 1e-9
+
+    def test_decode_attention_matches_last_row(self):
+        """One query row against the key/value cache is the last row of full attention, per head."""
+        import _metatensor
+        rows, d, h = 5, 4, 2
+        flat = [float(((i * 7) % 13) - 6) / 8.0 for i in range(rows * 3 * d)]
+        qkv = _metatensor.tensor(flat, [rows, 3 * d])
+        cache = _metatensor.zeros([8, 3 * d])
+        assert cache.write_rows(0, qkv) is cache
+        last = _metatensor.tensor(flat[(rows - 1) * 3 * d:], [1, 3 * d])
+        full = qkv.attn_scores(qkv, h, d, 0, d).tolist()
+        dec = last.decode_scores(cache, h, rows, d, 0, d).tolist()
+        assert len(dec) == h * rows
+        for hd in range(h):
+            for j in range(rows):
+                want = full[(hd * rows + rows - 1) * rows + j]
+                assert abs(dec[hd * rows + j] - want) < 1e-12
+        pfull = _metatensor.tensor(full, [h * rows, rows])
+        cfull = pfull.attn_context(qkv, h, d, 2 * d).tolist()
+        pdec = _metatensor.tensor(dec, [h, rows])
+        cdec = pdec.decode_context(cache, h, d, 2 * d).tolist()
+        assert len(cdec) == d
+        for c in range(d):
+            assert abs(cdec[c] - cfull[(rows - 1) * d + c]) < 1e-12
+
+    def test_write_rows_in_place_and_bounds(self):
+        import _metatensor
+        t = _metatensor.zeros([3, 2])
+        t.write_rows(1, _metatensor.tensor([1.0, 2.0], [1, 2]))
+        assert t.tolist() == [0.0, 0.0, 1.0, 2.0, 0.0, 0.0]
+        raises(ValueError, t.write_rows, 3, _metatensor.tensor([1.0, 2.0],
+                                                               [1, 2]))
+
+    def test_attn_batched_matches_per_sequence(self):
+        """With seqs > 1 each folded sequence must match its standalone result."""
+        import _metatensor
+        seqs, rows, d, h = 3, 3, 4, 2
+        n = rows * 3 * d
+        flat = [float(((i * 7) % 13) - 6) / 8.0 for i in range(seqs * n)]
+        qkv = _metatensor.tensor(flat, [seqs * rows, 3 * d])
+        s = qkv.attn_scores(qkv, h, d, 0, d, seqs).tolist()
+        assert len(s) == seqs * h * rows * rows
+        p = _metatensor.tensor(s, [seqs * h * rows, rows])
+        c = p.attn_context(qkv, h, d, 2 * d, seqs).tolist()
+        assert len(c) == seqs * rows * d
+        for b in range(seqs):
+            one = _metatensor.tensor(flat[b * n:(b + 1) * n], [rows, 3 * d])
+            s1 = one.attn_scores(one, h, d, 0, d).tolist()
+            p1 = _metatensor.tensor(s1, [h * rows, rows])
+            c1 = p1.attn_context(one, h, d, 2 * d).tolist()
+            off = b * h * rows * rows
+            for i in range(len(s1)):
+                assert abs(s1[i] - s[off + i]) < 1e-9
+            off = b * rows * d
+            for i in range(len(c1)):
+                assert abs(c1[i] - c[off + i]) < 1e-9
+
+    def test_attn_batched_rejects_bad_sequence_count(self):
+        import _metatensor
+        qkv = _metatensor.tensor([0.0] * (6 * 12), [6, 12])
+        raises(ValueError, qkv.attn_scores, qkv, 2, 4, 0, 4, 4)
+        raises(ValueError, qkv.attn_scores, qkv, 2, 4, 0, 4, 0)
+        s = qkv.attn_scores(qkv, 2, 4, 0, 4, 2)
+        p = _metatensor.tensor(s.tolist(), [2 * 2 * 3, 3])
+        raises(ValueError, p.attn_context, qkv, 2, 4, 8, 3)
+
+    def test_take_rows(self):
+        import _metatensor
+        table = _metatensor.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+        idx = _metatensor.tensor([2.0, 0.0, 2.0])
+        r = table.take(idx)
+        assert r.shape == (3, 2)
+        assert r.sum().item() == 25.0
+        pick = _metatensor.tensor([[1.0, 0.0], [0.0, 0.0], [0.0, 0.0]])
+        assert r.mul(pick).sum().item() == 5.0
+
+    def test_counters(self):
+        import _metatensor
+        before = _metatensor.kernel_count()
+        t = _metatensor.tensor([1.0, -2.0, 3.0])
+        assert ((t * t) + t).relu().sum().item() > 0.0
+        assert _metatensor.kernel_count() >= before
+        assert _metatensor.launch_count() >= 0
+
+    def test_force(self):
+        import _metatensor
+        t = _metatensor.tensor([1.0, -2.0, 3.0])
+        f = t.force()
+        assert f.tolist() == t.tolist()
+
+    def test_mem_total(self):
+        import _metatensor
+        assert isinstance(_metatensor.mem_total(), int)
+        assert _metatensor.mem_total() >= 0
+
+    def test_alloc_failed(self):
+        import _metatensor
+        assert _metatensor.alloc_failed() is False
+
+    def test_cpu_fallbacks(self):
+        import _metatensor
+        n = _metatensor.cpu_fallbacks()
+        assert isinstance(n, int)
+        t = _metatensor.tensor([1.0, -2.0, 3.0])
+        t.unary('log').sum().item()
+        # host loops are not fallbacks when the GPU is off
+        assert _metatensor.cpu_fallbacks() == n
+
+    def test_number_operands(self):
+        import _metatensor
+        x = _metatensor.tensor([1.0, 2.0, 4.0], dtype="float32")
+        assert x.add(1).tolist() == [2.0, 3.0, 5.0]
+        assert (x + 0.5).tolist() == [1.5, 2.5, 4.5]
+        assert (x * 2).tolist() == [2.0, 4.0, 8.0]
+        assert x.mul(-1.0).dtype == "float32"
+        assert (x - 1).tolist() == [0.0, 1.0, 3.0]
+        assert x.sub(1.0).tolist() == [0.0, 1.0, 3.0]
+        assert (x / 2).tolist() == [0.5, 1.0, 2.0]
+        assert x.div(4.0).tolist() == [0.25, 0.5, 1.0]
+        assert x.binary('gt', 1.5).where(1, -1).tolist() == [-1.0, 1.0, 1.0]
+        raises(TypeError, x.add, "a")
+
+    def test_strided(self):
+        import _metatensor
+        x = _metatensor.tensor([float(i) for i in range(24)]).reshape([2, 3, 4])
+        t = x.strided([4, 2, 3], [1, 12, 4])
+        assert t.shape == (4, 2, 3)
+        assert t.tolist()[:6] == [0.0, 4.0, 8.0, 12.0, 16.0, 20.0]
+        assert x.strided([3], [4], 13).tolist() == [13.0, 17.0, 21.0]
+        assert x.strided([2, 2], [0, -1], 3).tolist() == [3.0, 2.0, 3.0, 2.0]
+        raises(ValueError, x.strided, [3], [12], 0)
+        raises(ValueError, x.strided, [2], [-1], 0)
+        raises(ValueError, x.strided, [2, 2], [1], 0)
+
+    def test_cat(self):
+        import _metatensor
+        a = _metatensor.tensor([[1.0, 2.0], [3.0, 4.0]])
+        b = _metatensor.tensor([[5.0], [6.0]])
+        r = _metatensor.cat([a, b], 2)
+        assert r.shape == (2, 3)
+        assert r.tolist() == [1.0, 2.0, 5.0, 3.0, 4.0, 6.0]
+        assert _metatensor.cat([a, b]).tolist() == [1.0, 2.0, 3.0, 4.0,
+                                                   5.0, 6.0]
+        many = _metatensor.cat([b] * 10, 2)
+        assert many.tolist() == [5.0] * 10 + [6.0] * 10
+        raises(ValueError, _metatensor.cat, [a, b], 3)
+        raises(ValueError, _metatensor.cat, [], 1)
+        raises(ValueError, _metatensor.cat,
+               [a, _metatensor.tensor([1.0, 2.0], dtype="float32")], 1)
+
+    def test_pad(self):
+        import _metatensor
+        x = _metatensor.tensor([[1.0, 2.0], [3.0, 4.0]])
+        r = x.pad([2, 2], [0, 1, 1, 0], -1.0)
+        assert r.shape == (3, 3)
+        assert r.tolist() == [-1.0, 1.0, 2.0, -1.0, 3.0, 4.0,
+                              -1.0, -1.0, -1.0]
+        assert x.pad([2, 2], [0, 0, -1, 0]).tolist() == [2.0, 4.0]
+        raises(ValueError, x.pad, [2, 2], [1, 1])
+        raises(ValueError, x.pad, [3], [1, 1])
+
+    def test_gather_index_select(self):
+        import _metatensor
+        x = _metatensor.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        r = x.gather(_metatensor.tensor([2.0, 0.0]), 2)
+        assert r.tolist() == [3.0, 4.0]
+        r = x.index_select(_metatensor.tensor([2.0, 0.0]), 2)
+        assert r.tolist() == [3.0, 1.0, 6.0, 4.0]
+        r = x.index_select(_metatensor.tensor([1.0]), 1, 3)
+        assert r.tolist() == [4.0, 5.0, 6.0]
+        raises(ValueError, x.gather, _metatensor.tensor([1.0, 0.0, 1.0]), 2)
+
+    def test_conv2d_groups(self):
+        import _metatensor
+        # two channels, depthwise 1x1 scaling and a grouped 1x1
+        x = _metatensor.tensor([[1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]])
+        w = _metatensor.tensor([[2.0], [3.0]])
+        r = x.conv2d(w, 2, 2, 2, None, 1, 1, 0, groups=2)
+        assert r.tolist() == [2.0, 4.0, 6.0, 8.0, 30.0, 60.0, 90.0, 120.0]
+        w = _metatensor.tensor([[1.0, -1.0], [1.0, 1.0]])
+        r = x.conv2d(w, 2, 2, 2, _metatensor.tensor([0.5, 0.0, 0.0, 0.0]), 1,
+                     1, 0, groups=2)
+        assert r.tolist()[:8] == [1.5, 2.5, 3.5, 4.5, -1.0, -2.0, -3.0, -4.0]
+        # a 1x2 kernel with dilation over one row: conv1d
+        x = _metatensor.tensor([[1.0, 2.0, 3.0, 4.0, 5.0]])
+        w = _metatensor.tensor([[1.0], [10.0]])
+        r = x.conv2d(w, 1, 1, 5, None, 1, 1, 0, kw=2, dilation=2)
+        assert r.tolist() == [31.0, 42.0, 53.0]
+        raises(ValueError, x.conv2d, w, 1, 1, 5, None, 1, 1, 0, groups=2)
+
+    def test_conv_transpose2d(self):
+        import _metatensor
+        x = _metatensor.tensor([[1.0, 2.0, 3.0, 4.0]])
+        w = _metatensor.tensor([[1.0, 10.0]])
+        r = x.conv_transpose2d(w, 1, 2, 2, None, 1, 2)
+        assert r.shape == (1, 2 * 3 * 3)
+        assert r.tolist() == [1.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 4.0,
+                              10.0, 0.0, 20.0, 0.0, 0.0, 0.0, 30.0, 0.0, 40.0]
+        w = _metatensor.tensor([[1.0], [1.0]])
+        r = x.conv_transpose2d(w, 1, 1, 4, None, 1, 1, 0, kw=2)
+        assert r.tolist() == [1.0, 3.0, 5.0, 7.0, 4.0]
+        raises(ValueError, x.conv_transpose2d, w, 1, 1, 4, None, 1, 1, 0,
+               output_padding=1)
+
+    def test_avg_pools(self):
+        import _metatensor
+        x = _metatensor.tensor([[float(i) for i in range(16)]])
+        r = x.avg_pool2d(1, 4, 4, 2)
+        assert r.tolist() == [2.5, 4.5, 10.5, 12.5]
+        r = x.avg_pool2d(1, 4, 4, 3, 2, 1, count_include_pad=False)
+        assert r.tolist() == [2.5, 4.0, 8.5, 10.0]
+        r = x.adaptive_avg_pool2d(1, 4, 4, 1)
+        assert r.tolist() == [7.5]
+        r = x.adaptive_avg_pool2d(1, 4, 4, 3, 2)
+        assert r.tolist() == [2.5, 4.5, 6.5, 8.5, 10.5, 12.5]
+        raises(ValueError, x.avg_pool2d, 1, 4, 4, 2, 2, 2)
+
+    def test_unfused_fallbacks(self):
+        import _metatensor
+        n = _metatensor.unfused_fallbacks()
+        assert isinstance(n, int)
+        x = _metatensor.tensor([1.0, 2.0])
+        assert (x * 2.0 + 1.0).tolist() == [3.0, 5.0]
+        assert _metatensor.unfused_fallbacks() == n
+
+    def test_tofile(self):
+        import _metatensor, struct, os
+        path = self.tmpfile
+        x = _metatensor.tensor([1.5, -2.0, 4.0], dtype="float32")
+        x.tofile(path)
+        data = open(path, 'rb').read()
+        assert struct.unpack('<3f', data) == (1.5, -2.0, 4.0)
+        y = _metatensor.tensor([[1.0, 2.0], [3.0, 4.0]]).reshape([4])
+        y.tofile(path)
+        assert struct.unpack('<4d', open(path, 'rb').read()) == (
+            1.0, 2.0, 3.0, 4.0)
+        raises(OSError, x.tofile, '/nonexistent-dir/x')
+
+    def test_cross_attention(self):
+        import _metatensor
+        q = _metatensor.tensor([[1.0], [2.0]])
+        k = _metatensor.tensor([[1.0], [10.0], [100.0]])
+        s = q.attn_scores(k, 1)
+        assert s.shape == (2, 3)
+        assert s.tolist() == [1.0, 10.0, 100.0, 2.0, 20.0, 200.0]
+        c = s.attn_context(k, 1)
+        assert c.shape == (2, 1)
+        assert c.tolist() == [10101.0, 20202.0]
+        raises(ValueError, q.attn_scores, k, 1, -1, 0, 0, 2)
+
+    def test_basic_index_matches_python_slicing(self):
+        import _metatensor
+        shape = (4, 5, 6)
+        def ref(idx):
+            items = idx if type(idx) is tuple else (idx,)
+            if Ellipsis in items:
+                k = items.index(Ellipsis)
+                fill = 3 - (len(items) - 1 - items.count(None))
+                items = items[:k] + (slice(None),) * fill + items[k + 1:]
+            st = [30, 6, 1]
+            out, strides, off, d = [], [], 0, 0
+            for it in items:
+                if it is None:
+                    out.append(1)
+                    strides.append(0)
+                    continue
+                if isinstance(it, slice):
+                    a, b, s = it.indices(shape[d])
+                    out.append(len(range(a, b, s)))
+                    strides.append(st[d] * s)
+                    off += a * st[d]
+                else:
+                    off += (it + shape[d] if it < 0 else it) * st[d]
+                d += 1
+            for k in range(d, 3):
+                out.append(shape[k])
+                strides.append(st[k])
+            return out, strides, off
+        for idx in [(1, slice(None), 2), (Ellipsis, -1), slice(1, -1),
+                    (slice(None, None, 2), None, slice(4, 0, -1)),
+                    (slice(1, -2), Ellipsis, slice(None, -1))]:
+            out, tup, strides, off, ident = _metatensor.basic_index(shape,
+                                                                    idx)
+            assert (out, strides, off) == ref(idx)
+            assert tup == tuple(out)
+            assert not ident
+        r = _metatensor.basic_index(shape, (Ellipsis,))
+        assert r[4] and r[1] == shape
+        assert _metatensor.basic_index(shape, ([0, 1],)) is None
+        raises(IndexError, _metatensor.basic_index, shape, (4,))
+
+    def test_box_of(self):
+        import _metatensor
+        r = _metatensor.box_of((4, 5, 6), (slice(1, -1), Ellipsis, 2))
+        assert r == ([1, 0, 2], [2, 5, 1], (2, 5), False)
+        r = _metatensor.box_of((4, 5), (Ellipsis,))
+        assert r == ([0, 0], [4, 5], (4, 5), True)
+        assert _metatensor.box_of((4, 5), (slice(None, None, 2),)) is None
+        assert _metatensor.box_of((4, 5), (None,)) is None
+
+    def test_index_and_assign(self):
+        import _metatensor
+        vals = [float(i) for i in range(24)]
+        x = _metatensor.tensor(vals).reshape([2, 3, 4])
+        v, t = x.index((2, 3, 4), (Ellipsis, 1))
+        assert t == (2, 3)
+        assert v.tolist() == vals[1::4]
+        v, t = x.index((2, 3, 4), (Ellipsis,))
+        assert v is None and t == (2, 3, 4)
+        assert x.index((2, 3, 4), ([0],)) is None
+        box = _metatensor.tensor([-1.0, -2.0, -3.0])
+        y = x.assign((2, 3, 4), (1, slice(None), 2), box, (3,), False)
+        assert y is not x
+        want = list(vals)
+        for j in range(3):
+            want[12 + 4 * j + 2] = -1.0 - j
+        assert y.tolist() == want
+        assert x.tolist() == vals
+        z = y.assign((2, 3, 4), (0, 0, slice(1, 3)), 7.0, None, True)
+        assert z is y
+        want[1] = want[2] = 7.0
+        assert y.tolist() == want
+        big = _metatensor.tensor([1.0] * 16)
+        assert x.assign((2, 3, 4), (slice(0, 2), slice(0, 2)), big,
+                        (2, 2, 4), True) is not x
+        assert x.assign((2, 3, 4), (Ellipsis,), 1.0, None, True) is None
+        assert x.assign((2, 3, 4), (0, 0), box, (3,), False) is None
+        assert x.assign((2, 3, 4), (0, 0), box, (1, 3), False) is None
+        assert x.assign((2, 3, 4), (0, slice(0, 1)),
+                        _metatensor.tensor([0.5] * 4), (1, 1, 4),
+                        False).tolist()[:4] == [0.5] * 4
+
+    def test_shape_helpers(self):
+        import _metatensor as m
+        assert m.same_shape((2, 3), (2, 3)) and not m.same_shape((2, 3), (3,))
+        assert not m.same_shape((2, 3), (2, 4))
+        assert m.same_shape(None, None) and not m.same_shape(None, (2,))
+        assert m.numel((2, 3, 4)) == 24 and m.numel(()) == 1
+        assert m.broadcast_shape((4, 1, 3), (5, 1)) == (4, 5, 3)
+        raises(ValueError, m.broadcast_shape, (2, 3), (4,))
+        assert m.contiguous_strides((2, 3, 4)) == [12, 4, 1]
+        assert m.spread_strides((3, 1), 3) == [0, 1, 0]
+        assert m.expand_layout((3, 1), [1, 1], (2, -1, 4)) == \
+            ((2, 3, 4), [0, 1, 0])
+        assert m.infer_shape((2, -1), 12) == (2, 6)
+        assert m.infer_shape((5, 3), 12) is None
+        assert m.block_span((1, 5, 1), (2, 5, 7)) == (1, 2)
+        assert m.block_span((5, 7), (2, 5, 7)) == (1, 3)
+        assert m.block_span((4, 1), (2, 5, 7)) is None
+
+    def test_permute_layout(self):
+        import _metatensor as m
+        assert m.permute_layout((2, 3, 4), None, (2, 0, 1)) == \
+            ((4, 2, 3), (2, 0, 1))
+        assert m.permute_layout((4, 2, 3), (2, 0, 1), (1, 2, 0)) == \
+            ((2, 3, 4), None)
+        assert m.permute_layout((2, 3), None, (-1, 0)) == ((3, 2), (1, 0))

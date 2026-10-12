@@ -1,0 +1,1073 @@
+import math
+from rpython.rlib import jit
+from rpython.metatensor import core, device, lazy, ops, runtime
+
+
+def _ready(t):
+    """Fusion barrier for a library call. Not in devops, since a force reaches the kernel
+    compiler and the collector, which would make the ops random-effecting."""
+    if lazy.enabled():
+        lazy.force(t)
+    return t
+
+
+class Tensor(object):
+    def __init__(self, t, requires_grad=False):
+        self.t = t
+        self.requires_grad = requires_grad
+        self.grad = None
+        self.node = None
+        self.acc = None
+        self.seen = False
+
+    def _wrap(self, t, node, needs):
+        r = Tensor(t)
+        if needs:
+            r.requires_grad = True
+            r.node = node
+        return r
+
+    def add(self, other, p=-1):
+        if p < 0:
+            p = ops.bcast(self.t, other.t)
+        needs = self.requires_grad or other.requires_grad
+        node = None
+        if needs:
+            node = AddNode(self, other, p)
+        return self._wrap(ops.add_p(self.t, other.t, p), node, needs)
+
+    def mul(self, other, p=-1):
+        if p < 0:
+            p = ops.bcast(self.t, other.t)
+        needs = self.requires_grad or other.requires_grad
+        node = None
+        if needs:
+            node = MulNode(self, other, p)
+        return self._wrap(ops.mul_p(self.t, other.t, p), node, needs)
+
+    def relu(self):
+        r = Tensor(ops.relu(self.t))
+        if self.requires_grad:
+            r.requires_grad = True
+            r.node = ReluNode(self, r)
+        return r
+
+    def sum(self, axis=core.AXIS_ALL):
+        # A row reduction must promote the column count, or the pass compiles
+        # the default row tile. The composites below do this themselves.
+        if axis == 1 and ops.tensor_ndim(self.t) > 1:
+            ops.cols_of(self.t)
+        node = None
+        if self.requires_grad:
+            node = SumNode(self, axis)
+        return self._wrap(ops.sum_p(self.t, axis), node,
+                          self.requires_grad)
+
+    def item(self):
+        return ops.item(self.t)
+
+    def _forward_only(self, t, other):
+        r = Tensor(t)
+        needs = self.requires_grad
+        inputs = [self]
+        if other is not None:
+            inputs.append(other)
+            needs = needs or other.requires_grad
+        if needs:
+            r.requires_grad = True
+            r.node = NoGradNode(inputs)
+        return r
+
+    def sub(self, other, p=-1):
+        if p < 0:
+            p = ops.bcast(self.t, other.t)
+        needs = self.requires_grad or other.requires_grad
+        node = None
+        if needs:
+            node = SubNode(self, other, p)
+        return self._wrap(ops.sub_p(self.t, other.t, p), node, needs)
+
+    def div(self, other, p=-1):
+        if p < 0:
+            p = ops.bcast(self.t, other.t)
+        needs = self.requires_grad or other.requires_grad
+        r = self._wrap(ops.div_p(self.t, other.t, p), None, needs)
+        if needs:
+            r.node = DivNode(self, other, p, r)
+        return r
+
+    def exp(self):
+        r = Tensor(ops.exp_p(self.t))
+        if self.requires_grad:
+            r.requires_grad = True
+            r.node = ExpNode(self, r)
+        return r
+
+    def sqrt(self):
+        r = Tensor(ops.sqrt_p(self.t))
+        if self.requires_grad:
+            r.requires_grad = True
+            r.node = SqrtNode(self, r)
+        return r
+
+    def unary(self, fn):
+        return self._forward_only(ops.unary(self.t, fn), None)
+
+    def binary(self, other, fn, p=-1):
+        return self._forward_only(ops.binary(self.t, other.t, fn, p), other)
+
+    def where(self, a, b):
+        r = Tensor(ops.where(self.t, a.t, b.t))
+        if self.requires_grad or a.requires_grad or b.requires_grad:
+            r.requires_grad = True
+            r.node = NoGradNode([self, a, b])
+        return r
+
+    def max(self, axis=core.AXIS_ALL):
+        if axis == 1 and ops.tensor_ndim(self.t) > 1:
+            ops.cols_of(self.t)
+        r = Tensor(ops.maxr_p(self.t, axis))
+        if self.requires_grad:
+            r.requires_grad = True
+            if axis == 1:
+                r.node = MaxNode(self, r)
+            else:
+                inputs = [self]
+                r.node = NoGradNode(inputs)
+        return r
+
+    def _matmul(self, other, rows, cols, inner, tb, tf32=0, bias=None):
+        _ready(self.t)
+        _ready(other.t)
+        needs = self.requires_grad or other.requires_grad
+        if bias is not None and (needs or bias.requires_grad or
+                                 ops.tensor_dtype(self.t) != core.F32):
+            r = self._matmul(other, rows, cols, inner, tb, tf32)
+            return r.add(bias, core.BC_R_ROW)
+        node = None
+        if needs:
+            node = MatmulNode(self, other, rows, cols, inner, tb)
+        bt = core.NULLTENSOR
+        if bias is not None:
+            _ready(bias.t)
+            bt = bias.t
+        return self._wrap(
+            runtime.tensor_matmul(self.t, other.t, rows, cols, inner, 0, tb,
+                                  tf32, bt),
+            node, needs)
+
+    def matmul(self, other, transpose_b=False, tf32=0, bias=None):
+        if transpose_b:
+            rows, cols, inner = ops.matmul_shape_t(self.t, other.t)
+            return self._matmul(other, rows, cols, inner, 1, tf32, bias)
+        rows, cols, inner = ops.matmul_shape(self.t, other.t)
+        return self._matmul(other, rows, cols, inner, 0, tf32, bias)
+
+    def bmm(self, other, batch, rows, cols, inner, tb):
+        _ready(self.t)
+        _ready(other.t)
+        needs = self.requires_grad or other.requires_grad
+        node = None
+        if needs:
+            node = BmmNode(self, other, batch, rows, cols, inner, tb)
+        return self._wrap(
+            runtime.tensor_bmm(self.t, other.t, batch, rows, cols, inner,
+                               0, tb),
+            node, needs)
+
+    def attn_scores(self, k, heads, rows, dh, lda=0, ldb=0, oa=0, ob=0,
+                    seqs=1, krows=0):
+        _ready(self.t)
+        _ready(k.t)
+        """seqs > 1: rows are a folded batch of seqs sequences of `rows` each.
+
+        The batch is (sequence, head), using the outer batch level of
+        tensor_bmm. Result is [seqs*heads*rows, rows], sequence-major.
+        krows > 0 is cross-attention: k has seqs*krows rows and the result is
+        [seqs*heads*rows, krows]. Inference only."""
+        d = heads * dh
+        kr = krows if krows > 0 else rows
+        if lda <= 0:
+            lda = d
+        if ldb <= 0:
+            ldb = d
+        node = None
+        needs = self.requires_grad or k.requires_grad
+        if needs:
+            node = AttnScoresNode(self, k, heads, rows, dh, lda, ldb, oa, ob,
+                                  seqs, kr)
+        return self._wrap(runtime.tensor_bmm(
+            self.t, k.t, heads, rows, kr, dh, 0, 1, lda, ldb, kr,
+            dh, dh, rows * kr, seqs * heads * rows * kr,
+            seqs * heads * rows, oa, ob, 0, 0,
+            seqs, rows * lda, kr * ldb, heads * rows * kr), node, needs)
+
+    def decode_scores(self, k, heads, qrows, krows, dh, lda, ldb, oa, ob):
+        """attn_scores with qrows query rows against the first krows rows of a
+        longer k (key/value cache). Result [heads*qrows, krows]. Inference only."""
+        _ready(self.t)
+        _ready(k.t)
+        return Tensor(runtime.tensor_bmm(
+            self.t, k.t, heads, qrows, krows, dh, 0, 1, lda, ldb, krows,
+            dh, dh, qrows * krows, heads * qrows * krows, heads * qrows,
+            oa, ob, 0, 0))
+
+    def decode_context(self, v, heads, qrows, krows, dh, ldb, ob):
+        """Inverse of decode_scores: [heads*qrows, krows] probabilities against the first krows rows of v, to [qrows, heads*dh]."""
+        _ready(self.t)
+        _ready(v.t)
+        d = heads * dh
+        return Tensor(runtime.tensor_bmm(
+            self.t, v.t, heads, qrows, dh, krows, 0, 0, krows, ldb, d,
+            qrows * krows, dh, dh, qrows * d, qrows, 0, ob, 0, 0))
+
+    def write_rows(self, row, src):
+        _ready(src.t)
+        runtime.tensor_write_rows(self.t, src.t, row)
+        return self
+
+    def attn_context(self, v, heads, rows, dh, ldb=0, ob=0, seqs=1, krows=0):
+        _ready(self.t)
+        _ready(v.t)
+        """Inverse of attn_scores: probabilities [seqs*heads*rows, rows] against v, to [seqs*rows, d].
+
+        krows > 0: probabilities are [seqs*heads*rows, krows] against seqs*krows rows of v."""
+        d = heads * dh
+        kr = krows if krows > 0 else rows
+        if ldb <= 0:
+            ldb = d
+        node = None
+        needs = self.requires_grad or v.requires_grad
+        if needs:
+            node = AttnContextNode(self, v, heads, rows, dh, ldb, ob, seqs, kr)
+        return self._wrap(runtime.tensor_bmm(
+            self.t, v.t, heads, rows, dh, kr, 0, 0, kr, ldb, d,
+            rows * kr, dh, dh, seqs * rows * d, seqs * rows, 0, ob, 0, 0,
+            seqs, heads * rows * kr, kr * ldb, rows * d), node, needs)
+
+    def rot_half(self, dh):
+        _ready(self.t)
+        node = None
+        if self.requires_grad:
+            node = RotHalfNode(self, dh)
+        return self._wrap(ops.gather(self.t, core.GA_ROTHALF, dh, 0), node,
+                          self.requires_grad)
+
+    def head_split(self, rows, dh, heads):
+        _ready(self.t)
+        node = None
+        if self.requires_grad:
+            node = HeadSplitNode(self, rows, dh, heads)
+        return self._wrap(ops.gather(self.t, core.GA_HEADSPLIT, dh, heads),
+                          node,
+                          self.requires_grad)
+
+    def head_merge(self, rows, dh, heads):
+        _ready(self.t)
+        node = None
+        if self.requires_grad:
+            node = HeadMergeNode(self, rows, dh, heads)
+        return self._wrap(ops.gather(self.t, core.GA_HEADMERGE, dh, heads),
+                          node,
+                          self.requires_grad)
+
+    @jit.unroll_safe
+    def reshape(self, shape_list):
+        node = None
+        if self.requires_grad:
+            old = []
+            for i in range(ops.tensor_ndim(self.t)):
+                old.append(ops.tensor_shape(self.t, i))
+            node = ReshapeNode(self, old)
+        return self._wrap(ops.reshape(self.t, shape_list), node,
+                          self.requires_grad)
+
+    def add_(self, other):
+        if self.requires_grad:
+            raise ValueError("a leaf Variable that requires grad is being "
+                              "used in an in-place operation")
+        ops.assign(self.t, ops.add(self.t, other.t))
+        return self
+
+    def mul_(self, other):
+        if self.requires_grad:
+            raise ValueError("a leaf Variable that requires grad is being "
+                              "used in an in-place operation")
+        ops.assign(self.t, ops.mul(self.t, other.t))
+        return self
+
+    def shape(self, axis):
+        return ops.tensor_shape(self.t, axis)
+
+    def size(self):
+        return ops.tensor_size(self.t)
+
+    @jit.unroll_safe
+    def backward(self):
+        if lazy.enabled():
+            # The tape reads saved tensors through library ops, so materialize once.
+            lazy.barrier()
+        order = []
+        _topo(self, order)
+        self.acc = Tensor(ops.ones_like(self.t))
+        i = len(order) - 1
+        while i >= 0:
+            t = order[i]
+            i -= 1
+            t.seen = False
+            g = t.acc
+            t.acc = None
+            if g is None:
+                continue
+            node = t.node
+            if node is None:
+                if t.requires_grad:
+                    t.grad = _accumulate(t.grad, g)
+                continue
+            grads = node.apply(g)
+            inputs = node.inputs
+            for j in range(len(grads)):
+                gj = grads[j]
+                if gj is not None:
+                    inputs[j].acc = _accumulate(inputs[j].acc, gj)
+
+
+def _accumulate(old, g):
+    if old is None:
+        return g
+    return Tensor(ops.add(old.t, g.t))
+
+
+@jit.unroll_safe
+def _topo(root, order):
+    root.seen = True
+    stack = [root]
+    todo = [0]
+    while len(stack) > 0:
+        top = len(stack) - 1
+        t = stack[top]
+        node = t.node
+        k = todo[top]
+        if node is not None and k < len(node.inputs):
+            todo[top] = k + 1
+            nxt = node.inputs[k]
+            if not nxt.seen:
+                nxt.seen = True
+                stack.append(nxt)
+                todo.append(0)
+            continue
+        stack.pop()
+        todo.pop()
+        order.append(t)
+
+
+def _unbroadcast(g, p, right):
+    if right:
+        row = core.BC_R_ROW
+        scalar = core.BC_R_SCALAR
+        col = core.BC_R_COL
+    else:
+        row = core.BC_L_ROW
+        scalar = core.BC_L_SCALAR
+        col = core.BC_L_COL
+    if p == row:
+        return Tensor(ops.sum(g.t, 0))
+    if p == scalar:
+        return Tensor(ops.sum(g.t, core.AXIS_ALL))
+    if p == col:
+        return Tensor(ops.sum(g.t, 1))
+    return g
+
+
+def _rp(p):
+    if (p == core.BC_L_ROW or p == core.BC_L_SCALAR or
+            p == core.BC_L_COL):
+        return core.BC_NONE
+    return p
+
+
+def _lp(p):
+    if p == core.BC_L_ROW:
+        return core.BC_R_ROW
+    if p == core.BC_L_SCALAR:
+        return core.BC_R_SCALAR
+    if p == core.BC_L_COL:
+        return core.BC_R_COL
+    return core.BC_NONE
+
+
+def _neg(t):
+    return ops.mul_p(t, runtime.scalar(-1.0),
+                              core.BC_R_SCALAR)
+
+
+def _z(ld, d):
+    if ld != d:
+        return 1
+    return 0
+
+
+def _bmm_slice_grad(a, b, h, rows, dh, ta, ldb, ldc, ob, oc, d):
+    return Tensor(runtime.tensor_bmm(
+        a, b, h, rows, dh, rows, ta, 0, rows, ldb, ldc,
+        rows * rows, dh, dh, rows * ldc, rows, 0, ob, oc, _z(ldc, d)))
+
+
+class Node(object):
+    def __init__(self, inputs):
+        self.inputs = inputs
+
+    def apply(self, g):
+        raise NotImplementedError
+
+
+class NoGradNode(Node):
+    def apply(self, g):
+        raise ValueError("no backward for this operation")
+
+
+class AddNode(Node):
+    def __init__(self, a, b, p):
+        inputs = [a]
+        inputs.append(b)
+        Node.__init__(self, inputs)
+        self.p = p
+
+    def apply(self, g):
+        ga = None
+        if self.inputs[0].requires_grad:
+            ga = _unbroadcast(g, self.p, False)
+        gb = None
+        if self.inputs[1].requires_grad:
+            gb = _unbroadcast(g, self.p, True)
+        grads = [ga]
+        grads.append(gb)
+        return grads
+
+
+class SubNode(Node):
+    def __init__(self, a, b, p):
+        inputs = [a]
+        inputs.append(b)
+        Node.__init__(self, inputs)
+        self.p = p
+
+    def apply(self, g):
+        ga = None
+        if self.inputs[0].requires_grad:
+            ga = _unbroadcast(g, self.p, False)
+        gb = None
+        if self.inputs[1].requires_grad:
+            gb = _unbroadcast(Tensor(_neg(g.t)), self.p, True)
+        grads = [ga]
+        grads.append(gb)
+        return grads
+
+
+class MulNode(Node):
+    def __init__(self, a, b, p):
+        inputs = [a]
+        inputs.append(b)
+        Node.__init__(self, inputs)
+        self.p = p
+
+    def apply(self, g):
+        a = self.inputs[0]
+        b = self.inputs[1]
+        ga = None
+        if a.requires_grad:
+            ga = _unbroadcast(
+                Tensor(ops.mul_p(g.t, b.t, _rp(self.p))),
+                self.p, False)
+        gb = None
+        if b.requires_grad:
+            gb = _unbroadcast(
+                Tensor(ops.mul_p(g.t, a.t, _lp(self.p))),
+                self.p, True)
+        grads = [ga]
+        grads.append(gb)
+        return grads
+
+
+class DivNode(Node):
+    def __init__(self, a, b, p, y):
+        inputs = [a]
+        inputs.append(b)
+        Node.__init__(self, inputs)
+        self.p = p
+        self.y = y
+
+    def apply(self, g):
+        a = self.inputs[0]
+        b = self.inputs[1]
+        ga = None
+        if a.requires_grad:
+            ga = _unbroadcast(
+                Tensor(ops.div_p(g.t, b.t, _rp(self.p))),
+                self.p, False)
+        gb = None
+        if b.requires_grad:
+            t = ops.mul_p(self.y.t, g.t, core.BC_NONE)
+            t = ops.div_p(t, b.t, _rp(self.p))
+            gb = _unbroadcast(Tensor(_neg(t)), self.p, True)
+        grads = [ga]
+        grads.append(gb)
+        return grads
+
+
+class ReluNode(Node):
+    def __init__(self, x, y):
+        inputs = [x]
+        Node.__init__(self, inputs)
+        self.y = y
+
+    def apply(self, g):
+        return [Tensor(ops.relugrad(self.y.t, g.t))]
+
+
+class ExpNode(Node):
+    def __init__(self, x, y):
+        inputs = [x]
+        Node.__init__(self, inputs)
+        self.y = y
+
+    def apply(self, g):
+        return [Tensor(ops.mul_p(g.t, self.y.t, core.BC_NONE))]
+
+
+class SqrtNode(Node):
+    def __init__(self, x, y):
+        inputs = [x]
+        Node.__init__(self, inputs)
+        self.y = y
+
+    def apply(self, g):
+        h = ops.mul_p(g.t, runtime.scalar(0.5),
+                               core.BC_R_SCALAR)
+        return [Tensor(ops.div_p(h, self.y.t, core.BC_NONE))]
+
+
+class SumNode(Node):
+    def __init__(self, x, axis):
+        inputs = [x]
+        Node.__init__(self, inputs)
+        self.axis = axis
+
+    def apply(self, g):
+        x = self.inputs[0]
+        if self.axis == 1:
+            ops.cols_of(x.t)
+            p = core.BC_R_COL
+        elif self.axis == 0:
+            p = core.BC_R_ROW
+        else:
+            p = core.BC_R_SCALAR
+        return [Tensor(ops.mul_p(ops.ones_like(x.t), g.t, p))]
+
+
+class MaxNode(Node):
+    def __init__(self, x, m):
+        inputs = [x]
+        Node.__init__(self, inputs)
+        self.m = m
+
+    def apply(self, g):
+        x = self.inputs[0]
+        ops.cols_of(x.t)
+        mask = ops.eqmask(x.t, self.m.t, core.BC_R_COL)
+        return [Tensor(ops.mul_p(mask, g.t, core.BC_R_COL))]
+
+
+class MatmulNode(Node):
+    def __init__(self, x, w, rows, cols, inner, tb):
+        inputs = [x]
+        inputs.append(w)
+        Node.__init__(self, inputs)
+        self.rows = rows
+        self.cols = cols
+        self.inner = inner
+        self.tb = tb
+
+    def apply(self, g):
+        x = self.inputs[0]
+        w = self.inputs[1]
+        gx = None
+        gw = None
+        if self.tb:
+            if x.requires_grad:
+                gx = Tensor(runtime.tensor_matmul(
+                    g.t, w.t, self.rows, self.inner, self.cols, 0, 0))
+            if w.requires_grad:
+                gw = Tensor(runtime.tensor_matmul(
+                    g.t, x.t, self.cols, self.inner, self.rows, 1, 0))
+        else:
+            if x.requires_grad:
+                gx = Tensor(runtime.tensor_matmul(
+                    g.t, w.t, self.rows, self.inner, self.cols, 0, 1))
+            if w.requires_grad:
+                gw = Tensor(runtime.tensor_matmul(
+                    x.t, g.t, self.inner, self.cols, self.rows, 1, 0))
+        grads = [gx]
+        grads.append(gw)
+        return grads
+
+
+class BmmNode(Node):
+    def __init__(self, a, b, batch, rows, cols, inner, tb):
+        inputs = [a]
+        inputs.append(b)
+        Node.__init__(self, inputs)
+        self.batch = batch
+        self.rows = rows
+        self.cols = cols
+        self.inner = inner
+        self.tb = tb
+
+    def apply(self, g):
+        a = self.inputs[0]
+        b = self.inputs[1]
+        ga = None
+        gb = None
+        if self.tb:
+            if a.requires_grad:
+                ga = Tensor(runtime.tensor_bmm(
+                    g.t, b.t, self.batch, self.rows, self.inner, self.cols,
+                    0, 0))
+            if b.requires_grad:
+                gb = Tensor(runtime.tensor_bmm(
+                    g.t, a.t, self.batch, self.cols, self.inner, self.rows,
+                    1, 0))
+        else:
+            if a.requires_grad:
+                ga = Tensor(runtime.tensor_bmm(
+                    g.t, b.t, self.batch, self.rows, self.inner, self.cols,
+                    0, 1))
+            if b.requires_grad:
+                gb = Tensor(runtime.tensor_bmm(
+                    a.t, g.t, self.batch, self.inner, self.cols, self.rows,
+                    1, 0))
+        grads = [ga]
+        grads.append(gb)
+        return grads
+
+
+class AttnScoresNode(Node):
+    def __init__(self, q, k, heads, rows, dh, lda, ldb, oa, ob, seqs=1,
+                 krows=0):
+        inputs = [q]
+        inputs.append(k)
+        Node.__init__(self, inputs)
+        self.heads = heads
+        self.rows = rows
+        self.dh = dh
+        self.lda = lda
+        self.ldb = ldb
+        self.oa = oa
+        self.ob = ob
+        self.seqs = seqs
+        self.krows = krows if krows > 0 else rows
+
+    def apply(self, g):
+        # Folded-batch and cross-attention forms are inference only. Refuse
+        # rather than return a wrong gradient.
+        if self.krows != self.rows:
+            raise ValueError("attn_scores backward needs krows == rows")
+        if self.seqs != 1:
+            raise ValueError("attn_scores backward does not support a folded "
+                             "batch of sequences (seqs > 1)")
+        q = self.inputs[0]
+        k = self.inputs[1]
+        h, rows, dh = self.heads, self.rows, self.dh
+        d = h * dh
+        la, lb = self.lda, self.ldb
+        gq = None
+        gk = None
+        if q.requires_grad:
+            gq = _bmm_slice_grad(g.t, k.t, h, rows, dh, 0, lb, la,
+                                 self.ob, self.oa, d)
+        if k.requires_grad:
+            gk = _bmm_slice_grad(g.t, q.t, h, rows, dh, 1, la, lb,
+                                 self.oa, self.ob, d)
+        grads = [gq]
+        grads.append(gk)
+        return grads
+
+
+class AttnContextNode(Node):
+    def __init__(self, p, v, heads, rows, dh, ldb, ob, seqs=1, krows=0):
+        inputs = [p]
+        inputs.append(v)
+        Node.__init__(self, inputs)
+        self.heads = heads
+        self.rows = rows
+        self.dh = dh
+        self.ldb = ldb
+        self.ob = ob
+        self.seqs = seqs
+        self.krows = krows if krows > 0 else rows
+
+    def apply(self, g):
+        if self.krows != self.rows:
+            raise ValueError("attn_context backward needs krows == rows")
+        if self.seqs != 1:
+            raise ValueError("attn_context backward does not support a "
+                             "folded batch of sequences (seqs > 1)")
+        p = self.inputs[0]
+        v = self.inputs[1]
+        h, rows, dh = self.heads, self.rows, self.dh
+        d = h * dh
+        lb = self.ldb
+        gp = None
+        gv = None
+        if p.requires_grad:
+            gp = Tensor(runtime.tensor_bmm(
+                g.t, v.t, h, rows, rows, dh, 0, 1, d, lb, rows,
+                dh, dh, rows * rows, h * rows * rows, h * rows,
+                0, self.ob))
+        if v.requires_grad:
+            gv = _bmm_slice_grad(p.t, g.t, h, rows, dh, 1, d, lb,
+                                 0, self.ob, d)
+        grads = [gp]
+        grads.append(gv)
+        return grads
+
+
+class RotHalfNode(Node):
+    def __init__(self, x, dh):
+        inputs = [x]
+        Node.__init__(self, inputs)
+        self.dh = dh
+
+    def apply(self, g):
+        return [Tensor(runtime.rot_half(g.t, self.dh))]
+
+
+class HeadSplitNode(Node):
+    def __init__(self, x, rows, dh, heads):
+        inputs = [x]
+        Node.__init__(self, inputs)
+        self.rows = rows
+        self.dh = dh
+        self.heads = heads
+
+    def apply(self, g):
+        return [Tensor(runtime.head_merge(g.t, self.rows, self.dh,
+                                          self.heads))]
+
+
+class HeadMergeNode(Node):
+    def __init__(self, x, rows, dh, heads):
+        inputs = [x]
+        Node.__init__(self, inputs)
+        self.rows = rows
+        self.dh = dh
+        self.heads = heads
+
+    def apply(self, g):
+        return [Tensor(runtime.head_split(g.t, self.rows, self.dh,
+                                          self.heads))]
+
+
+class ReshapeNode(Node):
+    def __init__(self, x, shape_list):
+        inputs = [x]
+        Node.__init__(self, inputs)
+        self.shape_list = shape_list
+
+    def apply(self, g):
+        return [Tensor(ops.reshape(g.t, self.shape_list))]
+
+
+@jit.unroll_safe
+def _extend(params, more):
+    for i in range(len(more)):
+        params.append(more[i])
+
+
+class Linear(object):
+    def __init__(self, weight, bias):
+        self.weight = weight
+        self.bias = bias
+        weight.requires_grad = True
+        bias.requires_grad = True
+
+    def forward(self, x):
+        return x.matmul(self.weight).add(self.bias).relu()
+
+    def parameters(self):
+        params = [self.weight]
+        params.append(self.bias)
+        return params
+
+
+class MLP(object):
+    def __init__(self, layers):
+        self.layers = layers
+
+    @jit.unroll_safe
+    def forward(self, x):
+        for i in range(len(self.layers)):
+            x = self.layers[i].forward(x)
+        return x
+
+    @jit.unroll_safe
+    def parameters(self):
+        params = []
+        for i in range(len(self.layers)):
+            params.append(self.layers[i].weight)
+            params.append(self.layers[i].bias)
+        return params
+
+
+@jit.unroll_safe
+def sgd_step(params, neg_lr):
+    for i in range(len(params)):
+        p = params[i]
+        g = p.grad
+        if g is not None:
+            p.t = ops.add(p.t, ops.mul(g.t, neg_lr.t))
+            p.grad = None
+
+
+def softmax(x):
+    ops.cols_of(x.t)
+    m = x.max(1)
+    e = x.sub(m, core.BC_R_COL).exp()
+    return e.div(e.sum(1), core.BC_R_COL)
+
+
+def logsumexp(x):
+    ops.cols_of(x.t)
+    m = x.max(1)
+    s = x.sub(m, core.BC_R_COL).exp().sum(1)
+    return s.unary(core.U_LOG).add(m, core.BC_NONE)
+
+
+def log_softmax(x):
+    ops.cols_of(x.t)
+    d = x.sub(x.max(1), core.BC_R_COL)
+    return d.sub(d.exp().sum(1).unary(core.U_LOG), core.BC_R_COL)
+
+
+def layernorm(x, gamma, beta, eps):
+    c = ops.cols_of(x.t)
+    inv = Tensor(runtime.scalar(1.0 / c))
+    epst = Tensor(runtime.scalar(eps))
+    mean = x.sum(1).mul(inv, core.BC_R_SCALAR)
+    d = x.sub(mean, core.BC_R_COL)
+    var = d.mul(d, core.BC_NONE).mul(inv, core.BC_R_SCALAR).sum(1)
+    denom = var.add(epst, core.BC_R_SCALAR).sqrt()
+    y = d.div(denom, core.BC_R_COL)
+    return y.mul(gamma, core.BC_R_ROW).add(beta, core.BC_R_ROW)
+
+
+def rmsnorm(x, gamma, eps):
+    c = ops.cols_of(x.t)
+    inv = Tensor(runtime.scalar(1.0 / c))
+    epst = Tensor(runtime.scalar(eps))
+    ms = x.mul(x, core.BC_NONE).mul(inv, core.BC_R_SCALAR).sum(1)
+    denom = ms.add(epst, core.BC_R_SCALAR).sqrt()
+    return x.div(denom, core.BC_R_COL).mul(gamma, core.BC_R_ROW)
+
+
+def gelu(x):
+    c = Tensor(runtime.scalar(-2.0 * math.sqrt(2.0 / math.pi)))
+    k = Tensor(runtime.scalar(0.044715))
+    one = Tensor(runtime.scalar(1.0))
+    x3 = x.mul(x, core.BC_NONE).mul(x, core.BC_NONE).mul(k, core.BC_R_SCALAR)
+    z = x.add(x3, core.BC_NONE).mul(c, core.BC_R_SCALAR)
+    return x.div(z.exp().add(one, core.BC_R_SCALAR), core.BC_NONE)
+
+
+def gelu_erf(x):
+    return x.unary(core.U_GELU)
+
+
+def silu(x):
+    return x.unary(core.U_SILU)
+
+
+def mha(x, wq, wk, wv, wo, heads):
+    rows = ops.tensor_shape(x.t, 0)
+    d = ops.tensor_shape(x.t, 1)
+    dh = d // heads
+    q = x._matmul(wq, rows, d, d, 0)
+    k = x._matmul(wk, rows, d, d, 0)
+    v = x._matmul(wv, rows, d, d, 0)
+    scores = q.attn_scores(k, heads, rows, dh)
+    scale = Tensor(runtime.scalar(1.0 / math.sqrt(dh)))
+    scaled = scores.mul(scale, core.BC_R_SCALAR)
+    ctx = softmax(scaled).attn_context(v, heads, rows, dh)
+    return ctx._matmul(wo, rows, d, d, 0)
+
+
+class MultiHead(object):
+    def __init__(self, wq, wk, wv, wo, heads, requires_grad=False):
+        self.wq = wq
+        self.wk = wk
+        self.wv = wv
+        self.wo = wo
+        self.heads = heads
+        if requires_grad:
+            wq.requires_grad = True
+            wk.requires_grad = True
+            wv.requires_grad = True
+            wo.requires_grad = True
+
+    def forward(self, x):
+        return mha(x, self.wq, self.wk, self.wv, self.wo, self.heads)
+
+    def parameters(self):
+        params = [self.wq]
+        params.append(self.wk)
+        params.append(self.wv)
+        params.append(self.wo)
+        return params
+
+
+class TransformerBlock(object):
+    def __init__(self, attn, gamma1, beta1, gamma2, beta2, mlp, eps,
+                 requires_grad=False):
+        self.attn = attn
+        self.gamma1 = gamma1
+        self.beta1 = beta1
+        self.gamma2 = gamma2
+        self.beta2 = beta2
+        self.mlp = mlp
+        self.eps = eps
+        if requires_grad:
+            gamma1.requires_grad = True
+            beta1.requires_grad = True
+            gamma2.requires_grad = True
+            beta2.requires_grad = True
+
+    @jit.unroll_safe
+    def forward(self, x):
+        h = layernorm(x, self.gamma1, self.beta1, self.eps)
+        x = x.add(self.attn.forward(h))
+        h2 = layernorm(x, self.gamma2, self.beta2, self.eps)
+        return x.add(self.mlp.forward(h2))
+
+    @jit.unroll_safe
+    def parameters(self):
+        params = []
+        _extend(params, self.attn.parameters())
+        params.append(self.gamma1)
+        params.append(self.beta1)
+        params.append(self.gamma2)
+        params.append(self.beta2)
+        _extend(params, self.mlp.parameters())
+        return params
+
+
+class Transformer(object):
+    def __init__(self, blocks, head):
+        self.blocks = blocks
+        self.head = head
+
+    @jit.unroll_safe
+    def forward(self, x):
+        for i in range(len(self.blocks)):
+            x = self.blocks[i].forward(x)
+        return self.head.forward(x)
+
+    @jit.unroll_safe
+    def parameters(self):
+        params = []
+        for i in range(len(self.blocks)):
+            _extend(params, self.blocks[i].parameters())
+        _extend(params, self.head.parameters())
+        return params
+
+
+class Conv2d(object):
+    def __init__(self, weight, bias, c, h, w, o):
+        self.weight = weight
+        self.bias = bias
+        self.c = c
+        self.h = h
+        self.w = w
+        self.o = o
+
+    def forward(self, x):
+        hw = self.h * self.w
+        rows = ops.tensor_size(x.t) // (self.c * hw)
+        cols = runtime.im2col(x.t, self.c, self.h, self.w, 3, 1)
+        y = runtime.tensor_matmul(cols, self.weight.t, rows * hw, self.o,
+                                  self.c * 9, 0, 0, 1)
+        y = ops.add_p(y, self.bias.t, core.BC_R_ROW)
+        return x._forward_only(runtime.col2chw(y, rows, hw, self.o),
+                               self.weight)
+
+
+class BatchNorm2d(object):
+    def __init__(self, c, eps=1e-05):
+        self.c = c
+        self.eps = eps
+        self.gamma = [1.0] * c
+        self.beta = [0.0] * c
+        self.mean = [0.0] * c
+        self.var = [1.0] * c
+        self.rows = -1
+        self.scale = core.NULLTENSOR
+        self.shift = core.NULLTENSOR
+
+    def set_stats(self, gamma, beta, mean, var):
+        self.gamma = gamma
+        self.beta = beta
+        self.mean = mean
+        self.var = var
+        self.rows = -1
+
+    def _prepare(self, rows, dtype):
+        a = core.column(rows, dtype)
+        b = core.column(rows, dtype)
+        for i in range(rows):
+            ci = i % self.c
+            g = self.gamma[ci] / math.sqrt(self.var[ci] + self.eps)
+            a.host[i] = g
+            b.host[i] = self.beta[ci] - self.mean[ci] * g
+        device.dev(a)
+        device.dev(b)
+        self.scale = a
+        self.shift = b
+        self.rows = rows
+
+    def forward(self, x, hw):
+        rows = ops.tensor_size(x.t) // hw
+        dt = ops.tensor_dtype(x.t)
+        if self.rows != rows or self.scale.dtype != dt:
+            self._prepare(rows, dt)
+        v = ops.view2(x.t, rows, hw)
+        y = ops.mul_p(v, self.scale, core.BC_R_COL)
+        return x._forward_only(
+            ops.add_p(y, self.shift, core.BC_R_COL), None)
+
+
+class MaxPool2d(object):
+    def __init__(self, c, h, w):
+        self.c = c
+        self.h = h
+        self.w = w
+
+    def forward(self, x):
+        return x._forward_only(runtime.maxpool2(x.t, self.c, self.h, self.w),
+                               None)
+
+
+class CNN(object):
+    def __init__(self, conv, bn, pool, fc):
+        self.conv = conv
+        self.bn = bn
+        self.pool = pool
+        self.fc = fc
+
+    @jit.unroll_safe
+    def forward(self, x):
+        y = self.conv.forward(x)
+        y = self.bn.forward(y, self.pool.h * self.pool.w)
+        y = self.pool.forward(y.relu())
+        cols = self.pool.c * (self.pool.h // 2) * (self.pool.w // 2)
+        shape = [ops.tensor_size(y.t) // cols]
+        shape.append(cols)
+        return self.fc.forward(y.reshape(shape))

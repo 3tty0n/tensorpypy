@@ -1,0 +1,180 @@
+#!/bin/bash
+set -e
+HERE=$(cd "$(dirname "$0")" && pwd)
+source "$HERE/config.sh"
+APP="$HERE/../applevel"
+BASELINES_ONLY=${BASELINES_ONLY:-0}
+if [ "$1" = "--baselines-only" ]; then BASELINES_ONLY=1; shift; fi
+eval_setup_pypy
+trap eval_cleanup_pypy EXIT
+
+TSV="$OUT/models.tsv"
+tsv_init "$TSV" "model\tsystem\tround\tsteady_us\tmaxabsdiff\targmax_match\tcompile_ms\tfirst_run_ms\tlaunches_per_iter\ttolerance\tpass\tbinary\treference"
+
+# Per-row provenance: the build and reference file the row was checked against.
+# Ours is identified by binary hash, the baselines by wheel version.
+PYPY_SHA=$(binary_sha "$PYPY")
+TORCH_VER=$(pkg_version "$TORCH_PYTHON" torch torch)
+JAX_VER=$(pkg_version "$JAX_PYTHON" jax jax)
+TRT_VER=$(pkg_version "$TRT_PYTHON" torch_tensorrt torch_tensorrt)
+binary_of() {
+  case "$1" in
+    ours) echo "${PYPY_SHA:-unknown}" ;;
+    jax|iree) echo "$JAX_VER" ;;
+    torch-tensorrt) echo "$TRT_VER" ;;
+    *) echo "$TORCH_VER" ;;
+  esac
+}
+
+# applevel/common.py's reference_name(): float32 keeps the plain name.
+reference_file() {
+  local dt=${RTENSOR_DTYPE:-float32}
+  if [ "$dt" = float32 ]; then echo logits_pypy.bin
+  else echo "logits_pypy_$dt.bin"; fi
+}
+
+record() {
+  local model=$1 system=$2 round=$3 out=$4
+  local steady=$(steady_of "$out")
+  local diff=$(diff_of "$out")
+  local argmax=$(echo "$out" | grep '^argmax' | sed 's/ maxabsdiff=.*//')
+  echo "$argmax" > "$OUT/.last_argmax_$system"
+  local match=""
+  if [ -f "$OUT/.last_argmax_ours" ] && [ -f "$OUT/.last_argmax_$system" ] && [ "$system" != "ours" ]; then
+    if [ "$(cat "$OUT/.last_argmax_ours")" = "$(cat "$OUT/.last_argmax_$system")" ]; then match=1; else match=0; fi
+  fi
+  local compile_ms=$(field_of "$out" compile_ms) first_ms=$(field_of "$out" first_run_ms)
+  # launches_per_iter is the dead-code guard (kernels the forward actually
+  # launches); tol/pass come from the shared tolerance_for table.
+  local launches=$(field_of "$out" launches_per_iter)
+  local tol=$(field_of "$out" tol) passed=$(field_of "$out" pass)
+  local binary=$(binary_of "$system")
+  # Taken now, not at startup: the ours run rewrites the reference file.
+  local refpath="${MODEL_WEIGHTS:-}/$(reference_file)"
+  local reference=unknown
+  [ -f "$refpath" ] && reference=$(sha256sum "$refpath" | cut -c1-12)
+  echo -e "$model\t$system\t$round\t${steady:-}\t${diff:-}\t${match}\t${compile_ms:-}\t${first_ms:-}\t${launches:-}\t${tol:-}\t${passed:-}\t${binary}\t${reference}" >> "$TSV"
+  bench_record models model="$model" system="$system" round="$round" \
+    steady_us="${steady:-}" maxabsdiff="${diff:-}" argmax_match="${match}" \
+    compile_ms="${compile_ms:-}" first_run_ms="${first_ms:-}" \
+    launches_per_iter="${launches:-}" tolerance="${tol:-}" pass="${passed:-}" \
+    binary="${binary}" reference="${reference}"
+}
+
+# One row from a system that may not run here (IREE's CUDA backend rejects some
+# models, optional venvs may be absent). Without this `set -e` turns a failing
+# `out=$(...) && record` into a silent exit that skips every remaining model.
+# record() needs the whole stdout, so this cannot use run_measurement.
+baseline_row() {
+  local model=$1 system=$2 round=$3; shift 3
+  local out err=$(mktemp) rc=0
+  out=$("$@" 2>"$err") || rc=$?
+  if [ "$rc" = 0 ] && echo "$out" | grep -q "steady_us="; then
+    record "$model" "$system" "$round" "$out"
+  else
+    echo "run_models.sh: $system failed for $model:" \
+         "$(grep -m1 -E 'error:|Error:|Exception|refusing' "$err" || tail -1 "$err")" >&2
+  fi
+  rm -f "$err"
+}
+
+# JAX/XLA and IREE rows come from jax_models.py in the optional venv; the
+# model name is its first argument. IREE_MODELS excludes:
+# - resnet18 (b1/b8): IREE's CUDA backend rejects the conv2d lowering of a
+#   StableHLO conv from jax.export, the same limitation as micro variant 9 (CNN).
+IREE_MODELS=" gpt2 distilgpt2 tiny-gpt2 bert-base bert-tiny bert-mini vit-base vit-tiny mixer_b16 smollm2-135m smollm2-360m qwen2.5-0.5b "
+jax_rows() {
+  local model=$1 jaxmodel=$2 weights=$3 round=$4; shift 4
+  [ -n "${JAX_PYTHON:-}" ] && [ -x "$JAX_PYTHON" ] || return 0
+  [ -n "$jaxmodel" ] || return 0
+  if has_baseline jax; then
+    baseline_row "$model" jax "$round" \
+      "$JAX_PYTHON" "$APP/jax_models.py" "$jaxmodel" jax "$weights" "$ITERS" "$WARMUP" "$@"
+  fi
+  if has_baseline iree; then
+    case "$IREE_MODELS" in
+      *" $model "*)
+        baseline_row "$model" iree "$round" \
+          "$JAX_PYTHON" "$APP/jax_models.py" "$jaxmodel" iree "$weights" "$ITERS" "$WARMUP" "$@" ;;
+    esac
+  fi
+}
+
+model() {
+  local model=$1 pyscript=$2 torchscript=$3 jaxmodel=$4 weights=$5; shift 5
+  # One tolerance per (workload class, dtype), read by every system's script.
+  MODEL_TOL=$(tolerance_for "$model")
+  export MODEL_TOL
+  MODEL_WEIGHTS=$weights
+  for round in $(seq "$ROUNDS"); do
+    progress_step "$model round $round/$ROUNDS"
+    if [ "$BASELINES_ONLY" != 1 ]; then
+      baseline_row "$model" ours "$round" \
+        "$RUN_PYPY" $JIT_FLAGS "$APP/$pyscript" "$weights" "$ITERS" "$WARMUP" "$@"
+      baseline_row "$model" torch-eager "$round" \
+        "$TORCH_PYTHON" "$APP/$torchscript" eager "$weights" "$ITERS" "$WARMUP" "$@"
+      baseline_row "$model" torch-compile "$round" \
+        "$TORCH_PYTHON" "$APP/$torchscript" compile "$weights" "$ITERS" "$WARMUP" "$@"
+    fi
+    if has_baseline compile-ro; then
+      baseline_row "$model" torch-compile-ro "$round" \
+        "$TORCH_PYTHON" "$APP/$torchscript" compile-ro "$weights" "$ITERS" "$WARMUP" "$@"
+    fi
+    if has_baseline compile-mat; then
+      baseline_row "$model" torch-compile-mat "$round" \
+        "$TORCH_PYTHON" "$APP/$torchscript" compile-mat "$weights" "$ITERS" "$WARMUP" "$@"
+    fi
+    jax_rows "$model" "$jaxmodel" "$weights" "$round" "$@"
+    if has_baseline tensorrt && [ -n "${TRT_PYTHON:-}" ]; then
+      baseline_row "$model" torch-tensorrt "$round" \
+        "$TRT_PYTHON" "$APP/$torchscript" tensorrt "$weights" "$ITERS" "$WARMUP" "$@"
+    fi
+  done
+}
+
+# fourth column: the jax_models.py model, "" where there is no JAX twin
+model_gpt2() { model gpt2 gpt2.py gpt2_torch.py gpt2 "$WEIGHTS/gpt2"; }
+model_gpt2-medium() { model gpt2-medium gpt2.py gpt2_torch.py gpt2 "$WEIGHTS/gpt2-medium"; }
+model_distilgpt2() { model distilgpt2 gpt2.py gpt2_torch.py gpt2 "$WEIGHTS/distilgpt2"; }
+model_tiny-gpt2() { model tiny-gpt2 gpt2.py gpt2_torch.py gpt2 "$WEIGHTS/tiny-gpt2"; }
+model_smollm2-135m() { model smollm2-135m llama.py llama_torch.py llama "$WEIGHTS/smollm2-135m"; }
+model_smollm2-360m() { model smollm2-360m llama.py llama_torch.py llama "$WEIGHTS/smollm2-360m"; }
+model_smollm2-1.7b() { model smollm2-1.7b llama.py llama_torch.py llama "$WEIGHTS/smollm2-1.7b"; }
+model_qwen2.5-0.5b() { model qwen2.5-0.5b llama.py llama_torch.py llama "$WEIGHTS/qwen2.5-0.5b"; }
+model_bert-base() { model bert-base bert.py bert_torch.py bert "$WEIGHTS/bert-base"; }
+model_bert-tiny() { model bert-tiny bert.py bert_torch.py bert "$WEIGHTS/bert-tiny"; }
+model_bert-mini() { model bert-mini bert.py bert_torch.py bert "$WEIGHTS/bert-mini"; }
+model_resnet18-b1() { model resnet18-b1 resnet.py resnet_torch.py resnet "$WEIGHTS/resnet18" 1; }
+model_resnet18-b8() { model resnet18-b8 resnet.py resnet_torch.py resnet "$WEIGHTS/resnet18" 8; }
+model_mixer_b16() { model mixer_b16 mixer.py mixer_torch.py mixer "$WEIGHTS/mixer_b16"; }
+model_vit-base() { model vit-base vit.py vit_torch.py vit "$WEIGHTS/vit-base"; }
+model_deit-tiny() { model deit-tiny vit.py vit_torch.py vit "$WEIGHTS/deit-tiny"; }
+model_vit-tiny() { model vit-tiny vit.py vit_torch.py vit "$WEIGHTS/vit-tiny"; }
+
+# The population: released, trained checkpoints that are actually served.
+POPULATION="distilgpt2 gpt2 gpt2-medium smollm2-135m smollm2-360m smollm2-1.7b qwen2.5-0.5b bert-mini bert-base resnet18-b1 resnet18-b8 mixer_b16 deit-tiny vit-base"
+# Synthetic launch-bound probes, reported apart from the population.
+# Excluded by the selection rule (benchmark/eval/select_models.py):
+# vit-tiny mirrors weights an individual re-uploaded; tiny-gpt2 and
+# bert-tiny are fixtures whose weights were never trained.  Runnable
+# by name, never by default.
+EXCLUDED="vit-tiny tiny-gpt2 bert-tiny"
+ALL_MODELS="$POPULATION"
+MODELS=${MODELS:-}
+if [ "$#" -gt 0 ]; then MODELS="$*"; fi
+MODELS=${MODELS:-$ALL_MODELS}
+
+progress_init models $((ROUNDS * $(echo $MODELS | wc -w)))
+
+for m in $MODELS; do
+  fn="model_$m"
+  if ! declare -f "$fn" >/dev/null; then
+    echo "run_models.sh: unknown model '$m', valid: $ALL_MODELS" >&2
+    exit 1
+  fi
+  "$fn"
+done
+
+progress_done
+rm -f "$OUT"/.last_argmax_*
+echo "wrote $TSV"

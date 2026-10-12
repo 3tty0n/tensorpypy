@@ -1,0 +1,17 @@
+Audit record for pypy/module/_metatensor/rule_leave.py
+
+The leave rule may use only the vocabulary in
+pypy/module/_metatensor/motion_iface.py. It must not import or name the
+fused representation, the resume data or any kernel detail.
+
+benchmark/eval/audit_rules.py checks this. It reads the rule's imports and
+the names it uses, and prints them.
+
+    python3 benchmark/eval/audit_rules.py pypy/module/_metatensor/rule_leave.py
+
+This passes. The rule imports only pypy.module._metatensor.motion_iface.
+
+    python3 benchmark/eval/audit_rules.py benchmark/motion/rule_leave_leaky.py
+
+This fails with a non-zero exit status. rule_leave_leaky.py is a copy of the
+rule that reaches past motion_iface, and the audit rejects it.

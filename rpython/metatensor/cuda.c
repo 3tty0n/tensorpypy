@@ -1,0 +1,1349 @@
+#include <cuda.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <dlfcn.h>
+#include <stdint.h>
+#include <unistd.h>
+
+#ifndef RPY_EXPORTED
+#  define RPY_EXPORTED extern __attribute__((visibility("default")))
+#endif
+
+#ifdef RTENSOR_CUBLAS_PATH
+#  define RT_STR_(x) #x
+#  define RT_STR(x) RT_STR_(x)
+#  define RTENSOR_CUBLAS_DEFAULT RT_STR(RTENSOR_CUBLAS_PATH)
+#else
+#  define RTENSOR_CUBLAS_DEFAULT "libcublas.so"
+#endif
+
+/* ==== cuBLAS entry points, loaded lazily with dlopen ==== */
+
+typedef int (*cublasCreate_v2_t)(void **handle);
+typedef int (*cublasDgemm_v2_t)(void *handle, int transa, int transb,
+    int m, int n, int k, const double *alpha, const double *A, int lda,
+    const double *B, int ldb, const double *beta, double *C, int ldc);
+typedef int (*cublasDgemmStridedBatched_t)(void *handle, int transa, int transb,
+    int m, int n, int k, const double *alpha, const double *A, int lda,
+    long long strideA, const double *B, int ldb, long long strideB,
+    const double *beta, double *C, int ldc, long long strideC, int batchCount);
+typedef int (*cublasSgemm_v2_t)(void *handle, int transa, int transb,
+    int m, int n, int k, const float *alpha, const float *A, int lda,
+    const float *B, int ldb, const float *beta, float *C, int ldc);
+typedef int (*cublasSgemmStridedBatched_t)(void *handle, int transa, int transb,
+    int m, int n, int k, const float *alpha, const float *A, int lda,
+    long long strideA, const float *B, int ldb, long long strideB,
+    const float *beta, float *C, int ldc, long long strideC, int batchCount);
+typedef int (*cublasHgemm_t)(void *handle, int transa, int transb,
+    int m, int n, int k, const unsigned short *alpha,
+    const unsigned short *A, int lda, const unsigned short *B, int ldb,
+    const unsigned short *beta, unsigned short *C, int ldc);
+typedef int (*cublasHgemmStridedBatched_t)(void *handle, int transa, int transb,
+    int m, int n, int k, const unsigned short *alpha,
+    const unsigned short *A, int lda, long long strideA,
+    const unsigned short *B, int ldb, long long strideB,
+    const unsigned short *beta, unsigned short *C, int ldc,
+    long long strideC, int batchCount);
+
+typedef int (*cublasDgemmBatched_t)(void *handle, int transa, int transb,
+    int m, int n, int k, const double *alpha, const double *const A[],
+    int lda, const double *const B[], int ldb, const double *beta,
+    double *const C[], int ldc, int batchCount);
+typedef int (*cublasSgemmBatched_t)(void *handle, int transa, int transb,
+    int m, int n, int k, const float *alpha, const float *const A[],
+    int lda, const float *const B[], int ldb, const float *beta,
+    float *const C[], int ldc, int batchCount);
+typedef int (*cublasHgemmBatched_t)(void *handle, int transa, int transb,
+    int m, int n, int k, const unsigned short *alpha,
+    const unsigned short *const A[], int lda,
+    const unsigned short *const B[], int ldb, const unsigned short *beta,
+    unsigned short *const C[], int ldc, int batchCount);
+
+static void *cublas_lib;
+static void *cublas_handle;
+static cublasCreate_v2_t p_cublasCreate_v2;
+static cublasDgemm_v2_t p_cublasDgemm_v2;
+static cublasDgemmStridedBatched_t p_cublasDgemmStridedBatched;
+typedef int (*cublasSetMathMode_t)(void *handle, int mode);
+static cublasSetMathMode_t p_cublasSetMathMode;
+static cublasSgemm_v2_t p_cublasSgemm_v2;
+static cublasSgemmStridedBatched_t p_cublasSgemmStridedBatched;
+static cublasHgemm_t p_cublasHgemm;
+static cublasHgemmStridedBatched_t p_cublasHgemmStridedBatched;
+static cublasDgemmBatched_t p_cublasDgemmBatched;
+static cublasSgemmBatched_t p_cublasSgemmBatched;
+static cublasHgemmBatched_t p_cublasHgemmBatched;
+static int cublas_inited;
+
+/* ==== half <-> double conversion ==== */
+
+#if defined(__FLT16_MANT_DIG__)
+typedef _Float16 rt_half;
+static unsigned short rt_f2h(double v)
+{
+    rt_half h = (rt_half)v;
+    unsigned short r;
+    memcpy(&r, &h, 2);
+    return r;
+}
+static double rt_h2f(unsigned short u)
+{
+    rt_half h;
+    memcpy(&h, &u, 2);
+    return (double)h;
+}
+#else
+static unsigned short rt_f2h(double v)
+{
+    float f = (float)v;
+    unsigned int b, sign, exp, man, r;
+    long shift, round;
+    memcpy(&b, &f, 4);
+    sign = (b >> 16) & 0x8000u;
+    exp = (b >> 23) & 0xffu;
+    man = b & 0x7fffffu;
+    if (exp == 0xff) return (unsigned short)(sign | 0x7c00u | (man ? 0x200u : 0u));
+    if (exp > 142) return (unsigned short)(sign | 0x7c00u);
+    if (exp < 100) return (unsigned short)sign;
+    if (exp < 113) {
+        man |= 0x800000u;
+        shift = 126 - exp;
+        round = man & ((1L << shift) - 1);
+        r = (unsigned int)(man >> shift);
+        if (round > (1L << (shift - 1)) ||
+            (round == (1L << (shift - 1)) && (r & 1u))) r++;
+        return (unsigned short)(sign | r);
+    }
+    r = ((exp - 112) << 10) | (man >> 13);
+    round = man & 0x1fffu;
+    if (round > 0x1000u || (round == 0x1000u && (r & 1u))) r++;
+    return (unsigned short)(sign | r);
+}
+static double rt_h2f(unsigned short u)
+{
+    unsigned int sign = (unsigned int)(u & 0x8000u) << 16;
+    unsigned int exp = (u >> 10) & 0x1fu;
+    unsigned int man = u & 0x3ffu;
+    unsigned int b;
+    float f;
+    if (exp == 0) {
+        if (!man) { memcpy(&f, &sign, 4); return (double)f; }
+        exp = 1;
+        while (!(man & 0x400u)) { man <<= 1; exp--; }
+        man &= 0x3ffu;
+    } else if (exp == 0x1f) {
+        b = sign | 0x7f800000u | (man << 13);
+        memcpy(&f, &b, 4);
+        return (double)f;
+    }
+    b = sign | ((exp + 112) << 23) | (man << 13);
+    memcpy(&f, &b, 4);
+    return (double)f;
+}
+
+/* ==== device state and initialisation ==== */
+
+#endif
+
+static CUcontext ctx;
+static int inited;
+typedef struct { CUdeviceptr p; long n; } buf_t;
+static buf_t *allocs, *freed;
+static long nallocs, capallocs, nfreed, capfreed;
+static long live_bytes, budget_bytes = 8L << 20, launches, fresh_since_gc;
+static long allocated_since_gc, live_after_gc;
+static long count_threshold = 1, just_collected;
+#define SLAB_BYTES (32L << 20)
+static CUresult rt_last_err;
+static CUdeviceptr slab_ptr;
+static long slab_left;
+static long mem_cap, device_bytes;
+
+static int rt_init(void)
+{
+    CUdevice dev;
+    if (inited) return inited > 0;
+    inited = -1;
+    if (cuInit(0) != CUDA_SUCCESS) return 0;
+    if (cuDeviceGet(&dev, 0) != CUDA_SUCCESS) return 0;
+    if (cuDevicePrimaryCtxRetain(&ctx, dev) != CUDA_SUCCESS) return 0;
+    if (cuCtxSetCurrent(ctx) != CUDA_SUCCESS) return 0;
+    inited = 1;
+    return 1;
+}
+
+static int rt_cublas_init(void)
+{
+    const char *path;
+    if (cublas_inited) return cublas_inited > 0;
+    cublas_inited = -1;
+    if (!rt_init()) return 0;
+    path = getenv("RTENSOR_CUBLAS");
+    if (!path) path = RTENSOR_CUBLAS_DEFAULT;
+    cublas_lib = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+    if (!cublas_lib) return 0;
+    p_cublasCreate_v2 = (cublasCreate_v2_t)dlsym(cublas_lib, "cublasCreate_v2");
+    p_cublasDgemm_v2 = (cublasDgemm_v2_t)dlsym(cublas_lib, "cublasDgemm_v2");
+    p_cublasDgemmStridedBatched = (cublasDgemmStridedBatched_t)dlsym(
+        cublas_lib, "cublasDgemmStridedBatched");
+    p_cublasSetMathMode = (cublasSetMathMode_t)dlsym(cublas_lib,
+                                                     "cublasSetMathMode");
+    p_cublasSgemm_v2 = (cublasSgemm_v2_t)dlsym(cublas_lib, "cublasSgemm_v2");
+    p_cublasSgemmStridedBatched = (cublasSgemmStridedBatched_t)dlsym(
+        cublas_lib, "cublasSgemmStridedBatched");
+    p_cublasHgemm = (cublasHgemm_t)dlsym(cublas_lib, "cublasHgemm");
+    p_cublasHgemmStridedBatched = (cublasHgemmStridedBatched_t)dlsym(
+        cublas_lib, "cublasHgemmStridedBatched");
+    p_cublasDgemmBatched = (cublasDgemmBatched_t)dlsym(
+        cublas_lib, "cublasDgemmBatched");
+    p_cublasSgemmBatched = (cublasSgemmBatched_t)dlsym(
+        cublas_lib, "cublasSgemmBatched");
+    p_cublasHgemmBatched = (cublasHgemmBatched_t)dlsym(
+        cublas_lib, "cublasHgemmBatched");
+    if (!p_cublasCreate_v2 || !p_cublasDgemm_v2) return 0;
+    if (p_cublasCreate_v2(&cublas_handle) != 0) return 0;
+    cublas_inited = 1;
+    return 1;
+}
+
+/* ==== slab allocator: free list, GC trigger, memory cap ==== */
+
+static void push(buf_t **arr, long *n, long *cap, CUdeviceptr p, long size)
+{
+    if (*n == *cap) {
+        *cap = *cap ? *cap * 2 : 1024;
+        *arr = realloc(*arr, *cap * sizeof(buf_t));
+    }
+    (*arr)[*n].p = p;
+    (*arr)[*n].n = size;
+    (*n)++;
+}
+
+static int fell_back_to_cpu, soft_fail;
+
+static long alloc_failed(long nbytes)
+{
+    if (soft_fail) return 0;
+    if (!fell_back_to_cpu) {
+        const char *nm = 0;
+        cuGetErrorName(rt_last_err, &nm);
+        fprintf(stderr, "metatensor: cuMemAlloc(%ld) failed with %ld MB live (%s), falling back to CPU\n",
+                nbytes, live_bytes >> 20, nm ? nm : "?");
+    }
+    fell_back_to_cpu = 1;
+    return 0;
+}
+
+RPY_EXPORTED long rt_cuda_alloc_failed(void)
+{
+    return fell_back_to_cpu;
+}
+
+static int own_alloc(long n)
+{
+    return ((n + 511) & ~511L) > SLAB_BYTES / 4;
+}
+
+static int alloc_mode = -1;
+
+static int amode(void)
+{
+    if (alloc_mode < 0) {
+        const char *e = getenv("RTENSOR_ALLOC_MODE");
+        alloc_mode = e ? atoi(e) : 0;
+    }
+    return alloc_mode;
+}
+
+static long size_class(long n)
+{
+    long k = 4096, step;
+    if (amode() & 1) return (n + 15) & ~15L;
+    if (n <= k) return (n + 511) & ~511L;
+    while (k * 2 < n) k *= 2;
+    step = k / 8;
+    return (n + step - 1) / step * step;
+}
+
+static long idle_bytes;
+static long st_hits, st_misses, st_released, st_release_calls, st_gc_cap, st_gc_budget;
+
+static void alloc_stats(void)
+{
+    fprintf(stderr, "metatensor: alloc hits=%ld misses=%ld released=%ld MB in %ld calls, gc cap=%ld budget=%ld, device=%ld MB idle=%ld MB live=%ld MB cap=%ld MB freed=%ld\n",
+            st_hits, st_misses, st_released >> 20, st_release_calls, st_gc_cap, st_gc_budget,
+            device_bytes >> 20, idle_bytes >> 20, live_bytes >> 20, mem_cap >> 20, nfreed);
+}
+
+static void push_freed(CUdeviceptr p, long size)
+{
+    push(&freed, &nfreed, &capfreed, p, size);
+    if (own_alloc(size)) idle_bytes += size;
+}
+
+static long find_freed(long size)
+{
+    long i, best = -1;
+    for (i = nfreed - 1; i >= 0; i--) {
+        if (freed[i].n == size) return i;
+        if (!(amode() & 2) && own_alloc(size) && freed[i].n > size && freed[i].n <= 2 * size &&
+                (best < 0 || freed[i].n < freed[best].n))
+            best = i;
+    }
+    return best;
+}
+
+static long take_freed(long *size)
+{
+    long i = find_freed(*size);
+    CUdeviceptr p;
+    if (i < 0) return 0;
+    p = freed[i].p;
+    *size = freed[i].n;
+    freed[i] = freed[--nfreed];
+    if (own_alloc(*size)) idle_bytes -= *size;
+    return (long)p;
+}
+
+static long owned_size(CUdeviceptr p, long size)
+{
+    long j;
+    if (!own_alloc(size)) return size;
+    for (j = nallocs - 1; j >= 0; j--)
+        if (allocs[j].p == p) return allocs[j].n;
+    return size;
+}
+
+static long release_until(long target)
+{
+    long i, j, released = 0;
+    st_release_calls++;
+    for (i = 0; i < nfreed && device_bytes > target; ) {
+        if (!own_alloc(freed[i].n)) { i++; continue; }
+        for (j = 0; j < nallocs; j++) {
+            if (allocs[j].p == freed[i].p) {
+                allocs[j] = allocs[--nallocs];
+                break;
+            }
+        }
+        cuMemFree(freed[i].p);
+        device_bytes -= freed[i].n;
+        idle_bytes -= freed[i].n;
+        released += freed[i].n;
+        st_released += freed[i].n;
+        freed[i] = freed[--nfreed];
+    }
+    return released;
+}
+
+static long rt_mem_cap(void);
+
+static CUresult device_alloc(CUdeviceptr *p, long nbytes)
+{
+    CUresult r;
+    r = cuMemAlloc(p, nbytes);
+    if (r == CUDA_ERROR_OUT_OF_MEMORY && release_until(device_bytes - nbytes) > 0)
+        r = cuMemAlloc(p, nbytes);
+    if (r == CUDA_ERROR_OUT_OF_MEMORY && release_until(0) > 0)
+        r = cuMemAlloc(p, nbytes);
+    return r;
+}
+
+RPY_EXPORTED long rt_cuda_alloc(long nbytes, long zero)
+{
+    CUdeviceptr p = 0;
+    long size = size_class(nbytes);
+    if (!rt_init()) return 0;
+    p = (CUdeviceptr)take_freed(&size);
+    if (p) st_hits++;
+    if (!p) {
+        static int stats = -1;
+        if (stats < 0) {
+            stats = getenv("RTENSOR_ALLOC_STATS") != NULL;
+            if (stats) atexit(alloc_stats);
+        }
+        st_misses++;
+        if (size <= SLAB_BYTES / 4) {
+            if (slab_left < size) {
+                CUdeviceptr s;
+                if ((rt_last_err = device_alloc(&s, SLAB_BYTES)) != CUDA_SUCCESS) return alloc_failed(SLAB_BYTES);
+                push(&allocs, &nallocs, &capallocs, s, SLAB_BYTES);
+                device_bytes += SLAB_BYTES;
+                slab_ptr = s;
+                slab_left = SLAB_BYTES;
+            }
+            p = slab_ptr;
+            slab_ptr += size;
+            slab_left -= size;
+        } else {
+            if ((rt_last_err = device_alloc(&p, size)) != CUDA_SUCCESS) return alloc_failed(size);
+            push(&allocs, &nallocs, &capallocs, p, size);
+            device_bytes += size;
+        }
+        fresh_since_gc++;
+        if (live_after_gc < 0) live_after_gc = live_bytes;
+        allocated_since_gc += size;
+    }
+    live_bytes += size;
+    if (zero) cuMemsetD8(p, 0, nbytes);
+    return (long)p;
+}
+
+RPY_EXPORTED long rt_cuda_alloc_soft(long nbytes, long zero)
+{
+    long p;
+    soft_fail = 1;
+    p = rt_cuda_alloc(nbytes, zero);
+    soft_fail = 0;
+    return p;
+}
+
+RPY_EXPORTED void rt_cuda_free(long dptr, long nbytes)
+{
+    long size = owned_size((CUdeviceptr)dptr, size_class(nbytes));
+    live_bytes -= size;
+    push_freed((CUdeviceptr)dptr, size);
+}
+
+RPY_EXPORTED long rt_cuda_live_bytes(void)
+{
+    return live_bytes;
+}
+
+RPY_EXPORTED void rt_cuda_set_budget(long bytes)
+{
+    budget_bytes = bytes;
+}
+
+RPY_EXPORTED long rt_cuda_mem_total(void)
+{
+    size_t freeb, totalb;
+    if (rt_init() && cuMemGetInfo(&freeb, &totalb) == CUDA_SUCCESS)
+        return (long)totalb;
+    return 0;
+}
+
+RPY_EXPORTED int rt_cuda_has_free(long nbytes)
+{
+    return find_freed(size_class(nbytes)) >= 0;
+}
+
+static long rt_mem_cap(void)
+{
+    size_t freeb, totalb;
+    if (!mem_cap) {
+        mem_cap = -1;
+        if (rt_init() && cuMemGetInfo(&freeb, &totalb) == CUDA_SUCCESS)
+            mem_cap = (long)(totalb / 10 * 7);
+    }
+    return mem_cap;
+}
+
+RPY_EXPORTED int rt_cuda_needs_gc(long nbytes)
+{
+    long threshold = budget_bytes > live_after_gc ? budget_bytes : live_after_gc;
+    long cap = rt_mem_cap();
+    long size = size_class(nbytes);
+    int reusable = rt_cuda_has_free(nbytes);
+    if (just_collected) {
+        just_collected = 0;
+        if (!reusable && count_threshold < 65536) count_threshold *= 2;
+        else if (reusable && count_threshold > 1) count_threshold /= 2;
+    }
+    if (reusable) return 0;
+    if (cap > 0 && device_bytes + size > cap) {
+        st_gc_cap++;
+        allocated_since_gc = 0;
+        fresh_since_gc = 0;
+        live_after_gc = -1;
+        just_collected = 1;
+        return 1;
+    }
+    if (allocated_since_gc < threshold && fresh_since_gc < count_threshold) return 0;
+    st_gc_budget++;
+    allocated_since_gc = 0;
+    fresh_since_gc = 0;
+    live_after_gc = -1;
+    just_collected = 1;
+    return 1;
+}
+
+RPY_EXPORTED void rt_cuda_reset(void)
+{
+    long i;
+    for (i = 0; i < nallocs; i++) cuMemFree(allocs[i].p);
+    nallocs = nfreed = 0;
+    idle_bytes = device_bytes = 0;
+    slab_ptr = 0;
+    slab_left = 0;
+    live_bytes = 0;
+}
+
+/* ==== kernel loading and debug names ==== */
+
+RPY_EXPORTED int rt_cuda_available(void)
+{
+    return rt_init();
+}
+
+static struct { long fn; char name[64]; } rt_names[4096];
+static int rt_nnames;
+static int rt_dbg = -1;
+static int dbg_on(void)
+{
+    if (rt_dbg < 0) rt_dbg = getenv("RTENSOR_DEBUG_LAUNCH") != NULL;
+    return rt_dbg;
+}
+static const char *rt_name_of(long fn)
+{
+    int i;
+    for (i = 0; i < rt_nnames; i++) if (rt_names[i].fn == fn) return rt_names[i].name;
+    return "?";
+}
+
+static void rt_warn_load(const char *what, const char *name, CUresult r)
+{
+    static int warned;
+    const char *err = 0;
+    if (warned) return;
+    warned = 1;
+    cuGetErrorString(r, &err);
+    fprintf(stderr, "metatensor: %s failed for kernel %s: %s\n"
+                    "metatensor: every kernel will run on the CPU instead\n",
+            what, name, err ? err : "?");
+}
+
+RPY_EXPORTED long rt_cuda_load(const char *ptx, const char *name)
+{
+    CUmodule mod;
+    CUfunction fn;
+    CUresult r;
+    if (!rt_init()) return 0;
+    if ((r = cuModuleLoadData(&mod, ptx)) != CUDA_SUCCESS) {
+        rt_warn_load("cuModuleLoadData", name, r);
+        return 0;
+    }
+    if ((r = cuModuleGetFunction(&fn, mod, name)) != CUDA_SUCCESS) {
+        rt_warn_load("cuModuleGetFunction", name, r);
+        return 0;
+    }
+    if (rt_nnames < 4096) {
+        rt_names[rt_nnames].fn = (long)fn;
+        snprintf(rt_names[rt_nnames].name, 64, "%s", name);
+        rt_nnames++;
+    }
+    return (long)fn;
+}
+
+RPY_EXPORTED void rt_cuda_warn_cpu(long fn)
+{
+    static int warned;
+    if (!warned) {
+        warned = 1;
+        fprintf(stderr, "metatensor: kernel %s did not launch; the op ran on "
+                        "the CPU (cpu_fallbacks())\n", rt_name_of(fn));
+    }
+}
+
+RPY_EXPORTED void rt_cuda_warn_unfused(long fn)
+{
+    static int warned;
+    if (!warned) {
+        warned = 1;
+        fprintf(stderr, "metatensor: fused kernel %s did not launch; its ops "
+                        "ran one kernel each (unfused_fallbacks())\n",
+                rt_name_of(fn));
+    }
+}
+
+RPY_EXPORTED void rt_cuda_warn_arity(long compiled, long launched)
+{
+    static int warned;
+    if (!warned) {
+        warned = 1;
+        fprintf(stderr, "metatensor: kernel compiled for %ld outputs but "
+                        "launched with %ld, running its ops one at a time\n",
+                compiled, launched);
+    }
+}
+
+RPY_EXPORTED long rt_cuda_launch_count(void)
+{
+    return launches;
+}
+
+static long unfused;
+
+static const char *unfused_why[] = {
+    "?", "no compiled kernel", "size differs from the static size",
+    "output arity differs", "dtype differs", "rows do not divide the size",
+    "row width differs from the static width", "row wider than the tile",
+    "an input is too small for its broadcast", "allocation or launch failed"};
+
+RPY_EXPORTED void rt_cuda_note_unfused(long fn, long why)
+{
+    static int dbg = -1;
+    unfused++;
+    if (dbg < 0) dbg = getenv("RTENSOR_DEBUG_UNFUSED") != NULL;
+    if (dbg)
+        fprintf(stderr, "metatensor: fused kernel %s ran unfused: %s\n",
+                fn ? rt_name_of(fn) : "-",
+                unfused_why[why >= 0 && why < 10 ? why : 0]);
+}
+
+RPY_EXPORTED void rt_cuda_debug_text(char *text)
+{
+    fprintf(stderr, "metatensor: %s\n", text);
+}
+
+RPY_EXPORTED long rt_cuda_unfused_count(void)
+{
+    return unfused;
+}
+
+/* ==== host <-> device transfers ==== */
+
+RPY_EXPORTED long rt_cuda_upload(double *host, long n, long dtype)
+{
+    long i, p;
+    void *staging;
+    if (dtype == 0) {
+        p = rt_cuda_alloc(n * 8, 0);
+        if (p) cuMemcpyHtoD((CUdeviceptr)p, host, n * 8);
+        return p;
+    }
+    p = rt_cuda_alloc(n * (dtype == 1 ? 4 : 2), 0);
+    if (!p) return 0;
+    staging = malloc(n * (size_t)(dtype == 1 ? 4 : 2));
+    if (!staging) return 0;
+    if (dtype == 1)
+        for (i = 0; i < n; i++) ((float *)staging)[i] = (float)host[i];
+    else
+        for (i = 0; i < n; i++) ((unsigned short *)staging)[i] = rt_f2h(host[i]);
+    cuMemcpyHtoD((CUdeviceptr)p, staging, n * (size_t)(dtype == 1 ? 4 : 2));
+    free(staging);
+    return p;
+}
+
+RPY_EXPORTED int rt_cuda_download(long dptr, double *host, long n, long dtype)
+{
+    long i;
+    void *staging;
+    int ok;
+    if (dtype == 0)
+        return cuMemcpyDtoH(host, (CUdeviceptr)dptr, n * 8) == CUDA_SUCCESS;
+    staging = malloc(n * (size_t)(dtype == 1 ? 4 : 2));
+    if (!staging) return 0;
+    ok = cuMemcpyDtoH(staging, (CUdeviceptr)dptr,
+                      n * (size_t)(dtype == 1 ? 4 : 2)) == CUDA_SUCCESS;
+    if (ok) {
+        if (dtype == 1)
+            for (i = 0; i < n; i++) host[i] = (double)((float *)staging)[i];
+        else
+            for (i = 0; i < n; i++) host[i] = rt_h2f(((unsigned short *)staging)[i]);
+    }
+    free(staging);
+    return ok;
+}
+
+RPY_EXPORTED int rt_dump(long dptr, double *host, long n, long dtype, long fd)
+{
+    size_t esz = dtype == 0 ? 8 : (dtype == 1 ? 4 : 2);
+    long chunk = 1L << 24, i, j, m;
+    char *buf, *p;
+    ssize_t w;
+    size_t left;
+    int ok = 1;
+    if (dptr && !rt_init()) return 0;
+    buf = malloc(chunk * esz);
+    if (!buf) return 0;
+    for (i = 0; ok && i < n; i += chunk) {
+        m = n - i < chunk ? n - i : chunk;
+        if (dptr) {
+            ok = cuMemcpyDtoH(buf, (CUdeviceptr)(dptr + i * esz), m * esz) ==
+                 CUDA_SUCCESS;
+        } else if (dtype == 0) {
+            memcpy(buf, host + i, m * esz);
+        } else {
+            for (j = 0; j < m; j++) {
+                if (dtype == 1)
+                    ((float *)buf)[j] = (float)host[i + j];
+                else
+                    ((unsigned short *)buf)[j] = rt_f2h(host[i + j]);
+            }
+        }
+        p = buf;
+        left = m * esz;
+        while (ok && left > 0) {
+            w = write((int)fd, p, left);
+            if (w <= 0) ok = 0;
+            else { p += w; left -= w; }
+        }
+    }
+    free(buf);
+    return ok;
+}
+
+RPY_EXPORTED int rt_cuda_copy(long dst, long src, long nbytes)
+{
+    if (!rt_init()) return 0;
+    return cuMemcpyDtoD_v2((CUdeviceptr)dst, (CUdeviceptr)src, nbytes) ==
+           CUDA_SUCCESS;
+}
+
+/* ==== timing, launch and gather entry points ==== */
+
+RPY_EXPORTED double rt_cuda_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+RPY_EXPORTED void rt_cuda_sync(void)
+{
+    cuCtxSynchronize();
+}
+
+RPY_EXPORTED int rt_cuda_launch(long fn, long *inputs, int ninputs, long n,
+                                long *outs, int nouts, int threads,
+                                long elems_per_block, int shared, int nextra,
+                                long cols)
+{
+    void *params[64];
+    void *null = 0;
+    long argn = n, argc = cols;
+    int i, k = 0;
+    unsigned blocks = (unsigned)((n + elems_per_block - 1) / elems_per_block);
+    if (!rt_init() || ninputs > 16 || nouts > 32 || nextra > 6) return 0;
+    for (i = 0; i < ninputs; i++) params[k++] = &inputs[i];
+    for (i = 0; i < nouts; i++) params[k++] = &outs[i];
+    params[k++] = &argn;
+    params[k++] = &argc;
+    for (i = 0; i < nextra; i++) params[k++] = &null;
+    if (shared > 49152 &&
+        cuFuncSetAttribute((CUfunction)fn,
+                           CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                           shared) != CUDA_SUCCESS)
+        return 0;
+    launches++;
+    {
+        CUresult r;
+        double t0 = 0.0;
+        if (dbg_on()) {
+            cuCtxSynchronize();
+            t0 = rt_cuda_now();
+        }
+        r = cuLaunchKernel((CUfunction)fn, blocks ? blocks : 1, 1, 1,
+                           threads, 1, 1, shared, 0, params, 0);
+        if (dbg_on()) {
+            CUresult sr = cuCtxSynchronize();
+            fprintf(stderr, "launch %s fn=%ld blocks=%u threads=%d n=%ld elems=%ld cols=%ld nin=%d nout=%d shared=%d nextra=%d -> %d/%d us=%.1f live=%ld MB\n",
+                    rt_name_of(fn), fn % 1000000000, blocks ? blocks : 1, threads, n,
+                    elems_per_block, cols, ninputs, nouts, shared, nextra,
+                    (int)r, (int)sr, (rt_cuda_now() - t0) * 1e6, live_bytes >> 20);
+        }
+        return r == CUDA_SUCCESS;
+    }
+}
+
+RPY_EXPORTED int rt_cuda_launch_grid(long fn, long *args, int nargs, long gx,
+                                     long gy, int threads, int shared,
+                                     int nextra)
+{
+    void *params[40];
+    void *null = 0;
+    int i, k = 0;
+    CUresult r;
+    if (!rt_init() || nargs > 32 || nextra > 6 || gx <= 0 || gy <= 0 ||
+        gy > 65535)
+        return 0;
+    for (i = 0; i < nargs; i++) params[k++] = &args[i];
+    for (i = 0; i < nextra; i++) params[k++] = &null;
+    if (shared > 48 * 1024 &&
+        cuFuncSetAttribute((CUfunction)fn,
+                           CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                           shared) != CUDA_SUCCESS)
+        return 0;
+    launches++;
+    r = cuLaunchKernel((CUfunction)fn, (unsigned)gx, (unsigned)gy, 1,
+                       threads, 1, 1, shared, 0, params, 0);
+    if (dbg_on()) {
+        CUresult sr = cuCtxSynchronize();
+        fprintf(stderr, "launch %s grid=%ldx%ld threads=%d shared=%d -> %d/%d live=%ld MB\n",
+                rt_name_of(fn), gx, gy, threads, shared, (int)r, (int)sr,
+                live_bytes >> 20);
+    }
+    return r == CUDA_SUCCESS;
+}
+
+/* Convolution runs its GEMM in TF32 as cuDNN does under torch's default
+   (cudnn.allow_tf32 on, matmul off); plain matmuls stay strict fp32.
+   RTENSOR_TF32=0 turns TF32 off everywhere. */
+#define RT_TF32_MATH 3
+static int tf32_env = -1;
+
+static int rt_tf32(long tf32)
+{
+    if (tf32_env < 0) {
+        const char *e = getenv("RTENSOR_TF32");
+        tf32_env = e ? atoi(e) : 1;
+    }
+    return tf32 && tf32_env;
+}
+
+static void rt_set_math(long tf32)
+{
+    if (!p_cublasSetMathMode) return;
+    p_cublasSetMathMode(cublas_handle, rt_tf32(tf32) ? RT_TF32_MATH : 0);
+}
+
+/* ==== cuBLASLt: pick the batched algorithm by measuring it, once per shape ====
+
+   cublasSgemmStridedBatched takes the first algorithm of cuBLASLt's heuristic,
+   which for small attention products (64x64x64, 197x197x64) is a 128x128-tile
+   kernel that leaves the GPU nearly empty. Only measuring says which entry is
+   better, so the first call per shape times the candidates and caches the
+   winner with its descriptors. */
+
+typedef struct { unsigned long long data[8]; } rt_lt_algo;
+typedef struct {
+    rt_lt_algo algo;
+    size_t workspace;
+    int state;
+    float waves;
+    int reserved[4];
+} rt_lt_heur;
+
+#define RT_LT_TRANSA 3
+#define RT_LT_TRANSB 4
+#define RT_LT_BATCH_COUNT 5
+#define RT_LT_BATCH_STRIDE 6
+#define RT_LT_PREF_WORKSPACE 1
+#define RT_LT_R_32F 0
+#define RT_LT_COMPUTE_32F 68
+#define RT_LT_COMPUTE_32F_FAST_TF32 77
+#define RT_LT_EPILOGUE 7
+#define RT_LT_BIAS_POINTER 8
+#define RT_LT_EPILOGUE_BIAS 4
+
+typedef int (*ltcreate_t)(void **);
+typedef int (*ltdesccreate_t)(void **, int compute, int scale);
+typedef int (*ltsetattr_t)(void *, int attr, const void *buf, size_t n);
+typedef int (*ltdestroy_t)(void *);
+typedef int (*ltlayout_t)(void **, int dtype, unsigned long long rows,
+                          unsigned long long cols, long ld);
+typedef int (*ltprefcreate_t)(void **);
+typedef int (*ltheur_t)(void *lt, void *op, void *a, void *b, void *c, void *d,
+                        void *pref, int requested, rt_lt_heur *results,
+                        int *returned);
+typedef int (*ltmatmul_t)(void *lt, void *op, const void *alpha,
+                          const void *A, void *La, const void *B, void *Lb,
+                          const void *beta, const void *C, void *Lc,
+                          void *D, void *Ld, const rt_lt_algo *algo,
+                          void *ws, size_t wsbytes, void *stream);
+
+static void *lt_lib, *lt_handle, *lt_ws;
+static size_t lt_ws_bytes = 8u << 20;
+static ltdesccreate_t p_ltDescCreate;
+static ltsetattr_t p_ltDescSetAttr, p_ltLayoutSetAttr, p_ltPrefSetAttr;
+static ltdestroy_t p_ltDescDestroy, p_ltLayoutDestroy, p_ltPrefDestroy;
+static ltlayout_t p_ltLayoutCreate;
+static ltprefcreate_t p_ltPrefCreate;
+static ltheur_t p_ltHeuristic;
+static ltmatmul_t p_ltMatmul;
+static int lt_inited;
+
+/* ponytail: linear scan over a handful of shapes; a hash table if a model
+   ever brings hundreds. */
+#define RT_LT_KEYS 14
+#define RT_LT_MAX 128
+typedef struct {
+    long key[RT_LT_KEYS];
+    void *op, *La, *Lb, *Lc;
+    rt_lt_algo algo;
+    int usable;
+} rt_lt_entry;
+static rt_lt_entry lt_cache[RT_LT_MAX];
+static int lt_ncache;
+
+static int rt_lt_init(void)
+{
+    const char *path;
+    char buf[512];
+    if (lt_inited) return lt_inited > 0;
+    lt_inited = -1;
+    if (getenv("RTENSOR_NO_CUBLASLT")) return 0;
+    if (!rt_cublas_init()) return 0;
+    lt_lib = dlopen("libcublasLt.so.13", RTLD_NOW | RTLD_GLOBAL);
+    if (!lt_lib) lt_lib = dlopen("libcublasLt.so.12", RTLD_NOW | RTLD_GLOBAL);
+    if (!lt_lib) lt_lib = dlopen("libcublasLt.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!lt_lib) {
+        /* the venv ships libcublasLt next to libcublas under its own name */
+        path = getenv("RTENSOR_CUBLAS");
+        if (!path) path = RTENSOR_CUBLAS_DEFAULT;
+        {
+            const char *base = strstr(path, "libcublas.");
+            if (base && (size_t)(base - path) + strlen(base) + 3 < sizeof(buf)) {
+                memcpy(buf, path, base - path);
+                snprintf(buf + (base - path), sizeof(buf) - (base - path),
+                         "libcublasLt.%s", base + strlen("libcublas."));
+                lt_lib = dlopen(buf, RTLD_NOW | RTLD_GLOBAL);
+            }
+        }
+    }
+    if (!lt_lib) return 0;
+    p_ltDescCreate = (ltdesccreate_t)dlsym(lt_lib, "cublasLtMatmulDescCreate");
+    p_ltDescSetAttr = (ltsetattr_t)dlsym(lt_lib, "cublasLtMatmulDescSetAttribute");
+    p_ltDescDestroy = (ltdestroy_t)dlsym(lt_lib, "cublasLtMatmulDescDestroy");
+    p_ltLayoutCreate = (ltlayout_t)dlsym(lt_lib, "cublasLtMatrixLayoutCreate");
+    p_ltLayoutSetAttr = (ltsetattr_t)dlsym(lt_lib, "cublasLtMatrixLayoutSetAttribute");
+    p_ltLayoutDestroy = (ltdestroy_t)dlsym(lt_lib, "cublasLtMatrixLayoutDestroy");
+    p_ltPrefCreate = (ltprefcreate_t)dlsym(lt_lib, "cublasLtMatmulPreferenceCreate");
+    p_ltPrefSetAttr = (ltsetattr_t)dlsym(lt_lib, "cublasLtMatmulPreferenceSetAttribute");
+    p_ltPrefDestroy = (ltdestroy_t)dlsym(lt_lib, "cublasLtMatmulPreferenceDestroy");
+    p_ltHeuristic = (ltheur_t)dlsym(lt_lib, "cublasLtMatmulAlgoGetHeuristic");
+    p_ltMatmul = (ltmatmul_t)dlsym(lt_lib, "cublasLtMatmul");
+    if (!p_ltDescCreate || !p_ltDescSetAttr || !p_ltLayoutCreate ||
+        !p_ltLayoutSetAttr || !p_ltPrefCreate || !p_ltPrefSetAttr ||
+        !p_ltHeuristic || !p_ltMatmul) return 0;
+    /* cublasLtCreate lives in the same library as the rest of Lt. */
+    {
+        ltcreate_t create = (ltcreate_t)dlsym(lt_lib, "cublasLtCreate");
+        if (!create || create(&lt_handle) != 0) return 0;
+    }
+    {
+        CUdeviceptr p = 0;
+        if (cuMemAlloc(&p, lt_ws_bytes) != CUDA_SUCCESS) return 0;
+        lt_ws = (void *)p;
+    }
+    lt_inited = 1;
+    return 1;
+}
+
+static void rt_lt_destroy(rt_lt_entry *e)
+{
+    if (e->op && p_ltDescDestroy) p_ltDescDestroy(e->op);
+    if (e->La && p_ltLayoutDestroy) p_ltLayoutDestroy(e->La);
+    if (e->Lb && p_ltLayoutDestroy) p_ltLayoutDestroy(e->Lb);
+    if (e->Lc && p_ltLayoutDestroy) p_ltLayoutDestroy(e->Lc);
+    e->op = e->La = e->Lb = e->Lc = 0;
+}
+
+/* Descriptors in cuBLASLt's column-major world, matching what
+   rt_cuda_bmm hands cublasSgemmStridedBatched: the first operand is our B. */
+static int rt_lt_build(rt_lt_entry *e, long batch, long rows, long inner,
+                       long cols, long ta, long tb, long lda, long ldb,
+                       long ldc, long long sa, long long sb, long long sc,
+                       long tf32, const float *bias)
+{
+    int compute = tf32 ? RT_LT_COMPUTE_32F_FAST_TF32 : RT_LT_COMPUTE_32F;
+    int scale = RT_LT_R_32F;
+    int opB = tb ? 1 : 0, opA = ta ? 1 : 0;
+    int32_t bc = (int32_t)batch;
+    uint32_t epi = RT_LT_EPILOGUE_BIAS;
+    if (p_ltDescCreate(&e->op, compute, scale) != 0) return 0;
+    if (p_ltDescSetAttr(e->op, RT_LT_TRANSA, &opB, sizeof(opB)) != 0) return 0;
+    if (p_ltDescSetAttr(e->op, RT_LT_TRANSB, &opA, sizeof(opA)) != 0) return 0;
+    if (bias && (p_ltDescSetAttr(e->op, RT_LT_EPILOGUE, &epi, sizeof(epi)) != 0 ||
+                 p_ltDescSetAttr(e->op, RT_LT_BIAS_POINTER, &bias,
+                                 sizeof(bias)) != 0))
+        return 0;
+    if (p_ltLayoutCreate(&e->La, RT_LT_R_32F,
+                         (unsigned long long)(tb ? inner : cols),
+                         (unsigned long long)(tb ? cols : inner), ldb) != 0)
+        return 0;
+    if (p_ltLayoutCreate(&e->Lb, RT_LT_R_32F,
+                         (unsigned long long)(ta ? rows : inner),
+                         (unsigned long long)(ta ? inner : rows), lda) != 0)
+        return 0;
+    if (p_ltLayoutCreate(&e->Lc, RT_LT_R_32F, (unsigned long long)cols,
+                         (unsigned long long)rows, ldc) != 0)
+        return 0;
+    if (batch > 1) {
+        if (p_ltLayoutSetAttr(e->La, RT_LT_BATCH_COUNT, &bc, sizeof(bc)) != 0 ||
+            p_ltLayoutSetAttr(e->Lb, RT_LT_BATCH_COUNT, &bc, sizeof(bc)) != 0 ||
+            p_ltLayoutSetAttr(e->Lc, RT_LT_BATCH_COUNT, &bc, sizeof(bc)) != 0 ||
+            p_ltLayoutSetAttr(e->La, RT_LT_BATCH_STRIDE, &sb, sizeof(sb)) != 0 ||
+            p_ltLayoutSetAttr(e->Lb, RT_LT_BATCH_STRIDE, &sa, sizeof(sa)) != 0 ||
+            p_ltLayoutSetAttr(e->Lc, RT_LT_BATCH_STRIDE, &sc, sizeof(sc)) != 0)
+            return 0;
+    }
+    return 1;
+}
+
+/* Time every candidate on the real operands and keep the fastest. */
+static int rt_lt_tune(rt_lt_entry *e, const float *A, const float *B, float *C)
+{
+    rt_lt_heur res[8];
+    void *pref = 0;
+    float alpha = 1.0f, beta = 0.0f;
+    int nres = 0, i, j, r, best = -1;
+    double bestt = 0.0;
+    if (p_ltPrefCreate(&pref) != 0) return 0;
+    if (p_ltPrefSetAttr(pref, RT_LT_PREF_WORKSPACE, &lt_ws_bytes,
+                        sizeof(lt_ws_bytes)) != 0) {
+        p_ltPrefDestroy(pref);
+        return 0;
+    }
+    if (p_ltHeuristic(lt_handle, e->op, e->La, e->Lb, e->Lc, e->Lc, pref,
+                      8, res, &nres) != 0 || nres <= 0) {
+        p_ltPrefDestroy(pref);
+        return 0;
+    }
+    p_ltPrefDestroy(pref);
+    for (i = 0; i < nres; i++) {
+        double t0;
+        if (res[i].state != 0) continue;
+        for (j = 0; j < 3; j++)
+            if (p_ltMatmul(lt_handle, e->op, &alpha, B, e->La, A, e->Lb,
+                           &beta, C, e->Lc, C, e->Lc, &res[i].algo,
+                           lt_ws, lt_ws_bytes, 0) != 0)
+                goto next;
+        if (cuCtxSynchronize() != CUDA_SUCCESS) goto next;
+        for (r = 0; r < 4; r++) {
+            t0 = rt_cuda_now();
+            for (j = 0; j < 5; j++)
+                p_ltMatmul(lt_handle, e->op, &alpha, B, e->La, A, e->Lb,
+                           &beta, C, e->Lc, C, e->Lc, &res[i].algo,
+                           lt_ws, lt_ws_bytes, 0);
+            cuCtxSynchronize();
+            t0 = rt_cuda_now() - t0;
+            if (best < 0 || t0 < bestt) { best = i; bestt = t0; }
+        }
+    next:;
+    }
+    if (best < 0) return 0;
+    e->algo = res[best].algo;
+    return 1;
+}
+
+static rt_lt_entry *rt_lt_lookup(const long *key, long batch, long rows,
+                                 long inner, long cols, long ta, long tb,
+                                 long lda, long ldb, long ldc, long long sa,
+                                 long long sb, long long sc, long tf32,
+                                 const float *A, const float *B, float *C,
+                                 const float *bias)
+{
+    int i, k;
+    rt_lt_entry *e;
+    for (i = 0; i < lt_ncache; i++) {
+        for (k = 0; k < RT_LT_KEYS; k++)
+            if (lt_cache[i].key[k] != key[k]) break;
+        if (k == RT_LT_KEYS) {
+            e = &lt_cache[i];
+            if (bias && e->usable &&
+                p_ltDescSetAttr(e->op, RT_LT_BIAS_POINTER, &bias,
+                                sizeof(bias)) != 0)
+                return 0;
+            return e;
+        }
+    }
+    if (lt_ncache >= RT_LT_MAX) return 0;
+    e = &lt_cache[lt_ncache++];
+    for (k = 0; k < RT_LT_KEYS; k++) e->key[k] = key[k];
+    e->usable = 0;
+    if (rt_lt_build(e, batch, rows, inner, cols, ta, tb, lda, ldb, ldc,
+                    sa, sb, sc, tf32, bias) && rt_lt_tune(e, A, B, C))
+        e->usable = 1;
+    else
+        rt_lt_destroy(e);
+    return e;
+}
+
+/* Returns 0 when Lt cannot serve this call and the legacy path should. */
+static int rt_lt_bmm(long a, long b, long c, long batch, long rows,
+                     long inner, long cols, long ta, long tb, long lda,
+                     long ldb, long ldc, long long sa, long long sb,
+                     long long sc, long tf32)
+{
+    long key[RT_LT_KEYS];
+    rt_lt_entry *e;
+    float alpha = 1.0f, beta = 0.0f;
+    if (!rt_lt_init()) return 0;
+    key[0] = batch; key[1] = rows; key[2] = inner; key[3] = cols;
+    key[4] = ta; key[5] = tb; key[6] = lda; key[7] = ldb; key[8] = ldc;
+    key[9] = (long)sa; key[10] = (long)sb; key[11] = (long)sc;
+    key[12] = tf32;
+    key[13] = 0;
+    e = rt_lt_lookup(key, batch, rows, inner, cols, ta, tb, lda, ldb, ldc,
+                     sa, sb, sc, tf32, (const float *)a, (const float *)b,
+                     (float *)c, 0);
+    if (!e || !e->usable) return 0;
+    return p_ltMatmul(lt_handle, e->op, &alpha, (const void *)b, e->La,
+                      (const void *)a, e->Lb, &beta, (const void *)c, e->Lc,
+                      (void *)c, e->Lc, &e->algo, lt_ws, lt_ws_bytes, 0) == 0;
+}
+
+/* ==== cuBLAS gemm ==== */
+
+RPY_EXPORTED int rt_cuda_matmul(long a, long b, long c, long rows,
+                                long inner, long cols, long ta, long tb,
+                                long dtype, long tf32)
+{
+    double alpha = 1.0, beta = 0.0;
+    float alphaf = 1.0f, betaf = 0.0f;
+    unsigned short alphah = 0x3c00, betah = 0;
+    int ldb = tb ? (int)inner : (int)cols;
+    int lda = ta ? (int)rows : (int)inner;
+    if (!rt_cublas_init()) return 0;
+    if (dtype == 1) {
+        if (!p_cublasSgemm_v2) return 0;
+        rt_set_math(tf32);
+        return p_cublasSgemm_v2(cublas_handle, tb ? 1 : 0, ta ? 1 : 0,
+                                (int)cols, (int)rows, (int)inner, &alphaf,
+                                (const float *)b, ldb, (const float *)a, lda,
+                                &betaf, (float *)c, (int)cols) == 0;
+    }
+    if (dtype == 2) {
+        if (!p_cublasHgemm) return 0;
+        return p_cublasHgemm(cublas_handle, tb ? 1 : 0, ta ? 1 : 0,
+                             (int)cols, (int)rows, (int)inner, &alphah,
+                             (const unsigned short *)b, ldb,
+                             (const unsigned short *)a, lda,
+                             &betah, (unsigned short *)c, (int)cols) == 0;
+    }
+    return p_cublasDgemm_v2(cublas_handle, tb ? 1 : 0, ta ? 1 : 0,
+                            (int)cols, (int)rows, (int)inner, &alpha,
+                            (const double *)b, ldb, (const double *)a, lda,
+                            &beta, (double *)c, (int)cols) == 0;
+}
+
+static CUdeviceptr ones_dev;
+static long ones_n;
+
+static const float *rt_ones(long n)
+{
+    if (ones_n < n) {
+        if (ones_dev) cuMemFree(ones_dev);
+        ones_dev = 0;
+        ones_n = 0;
+        if (cuMemAlloc(&ones_dev, n * 4) != CUDA_SUCCESS) return 0;
+        if (cuMemsetD32(ones_dev, 0x3f800000u, n) != CUDA_SUCCESS) return 0;
+        ones_n = n;
+    }
+    return (const float *)ones_dev;
+}
+
+RPY_EXPORTED int rt_cuda_matmul_bias(long a, long b, long c, long bias,
+                                     long rows, long inner, long cols,
+                                     long ta, long tb, long tf32)
+{
+    long key[RT_LT_KEYS];
+    rt_lt_entry *e;
+    float alpha = 1.0f, beta = 0.0f;
+    const float *ones;
+    if (!rt_cublas_init()) return 0;
+    tf32 = rt_tf32(tf32);
+    if (rt_lt_init()) {
+        key[0] = 1; key[1] = rows; key[2] = inner; key[3] = cols;
+        key[4] = ta; key[5] = tb; key[6] = ta ? rows : inner;
+        key[7] = tb ? inner : cols; key[8] = cols;
+        key[9] = rows * inner; key[10] = inner * cols; key[11] = rows * cols;
+        key[12] = tf32;
+        key[13] = 1;
+        e = rt_lt_lookup(key, 1, rows, inner, cols, ta, tb, key[6], key[7],
+                         key[8], key[9], key[10], key[11], tf32,
+                         (const float *)a, (const float *)b, (float *)c,
+                         (const float *)bias);
+        if (e && e->usable &&
+            p_ltMatmul(lt_handle, e->op, &alpha, (const void *)b, e->La,
+                       (const void *)a, e->Lb, &beta, (const void *)c, e->Lc,
+                       (void *)c, e->Lc, &e->algo, lt_ws, lt_ws_bytes, 0) == 0)
+            return 1;
+    }
+    if (!p_cublasSgemm_v2 || !(ones = rt_ones(rows))) return 0;
+    if (!rt_cuda_matmul(a, b, c, rows, inner, cols, ta, tb, 1, tf32))
+        return 0;
+    beta = 1.0f;
+    rt_set_math(0);
+    return p_cublasSgemm_v2(cublas_handle, 0, 0, (int)cols, (int)rows, 1,
+                            &alpha, (const float *)bias, (int)cols, ones, 1,
+                            &beta, (float *)c, (int)cols) == 0;
+}
+
+RPY_EXPORTED int rt_cuda_bmm(long a, long b, long c, long batch, long rows,
+                             long inner, long cols, long ta, long tb,
+                             long dtype, long lda_, long ldb_, long ldc_,
+                             long sa, long sb, long sc, long tf32)
+{
+    double alpha = 1.0, beta = 0.0;
+    float alphaf = 1.0f, betaf = 0.0f;
+    unsigned short alphah = 0x3c00, betah = 0;
+    int ldb = ldb_ > 0 ? (int)ldb_ : (tb ? (int)inner : (int)cols);
+    int lda = lda_ > 0 ? (int)lda_ : (ta ? (int)rows : (int)inner);
+    int ldc = ldc_ > 0 ? (int)ldc_ : (int)cols;
+    long long stra = sa > 0 ? (long long)sa : (long long)(rows * inner);
+    long long strb = sb > 0 ? (long long)sb : (long long)(inner * cols);
+    long long strc = sc > 0 ? (long long)sc : (long long)(rows * cols);
+    if (!rt_cublas_init()) return 0;
+    tf32 = rt_tf32(tf32);
+    if (dtype == 1) {
+        if (rt_lt_bmm(a, b, c, batch, rows, inner, cols, ta, tb, lda, ldb,
+                      ldc, stra, strb, strc, tf32))
+            return 1;
+        if (!p_cublasSgemmStridedBatched) return 0;
+        rt_set_math(tf32);
+        return p_cublasSgemmStridedBatched(
+            cublas_handle, tb ? 1 : 0, ta ? 1 : 0,
+            (int)cols, (int)rows, (int)inner, &alphaf,
+            (const float *)b, ldb, strb,
+            (const float *)a, lda, stra,
+            &betaf, (float *)c, ldc, strc,
+            (int)batch) == 0;
+    }
+    if (dtype == 2) {
+        if (!p_cublasHgemmStridedBatched) return 0;
+        return p_cublasHgemmStridedBatched(
+            cublas_handle, tb ? 1 : 0, ta ? 1 : 0,
+            (int)cols, (int)rows, (int)inner, &alphah,
+            (const unsigned short *)b, ldb, strb,
+            (const unsigned short *)a, lda, stra,
+            &betah, (unsigned short *)c, ldc, strc,
+            (int)batch) == 0;
+    }
+    if (!p_cublasDgemmStridedBatched) return 0;
+    return p_cublasDgemmStridedBatched(cublas_handle, tb ? 1 : 0, ta ? 1 : 0,
+                                       (int)cols, (int)rows, (int)inner, &alpha,
+                                       (const double *)b, ldb,
+                                       strb,
+                                       (const double *)a, lda,
+                                       stra,
+                                       &beta, (double *)c, ldc,
+                                       strc,
+                                       (int)batch) == 0;
+}
+
+/* ==== the two-level batch as one call ====
+
+   The outer batch level (nb2 groups of `batch` matrices, sa2/sb2/sc2 elements
+   apart) is not one arithmetic progression, so a strided-batched GEMM cannot
+   express it, and nb2 separate calls cost about 5 us of host time each.
+   cublasXgemmBatched takes a device pointer array, so one call covers all
+   nb2*batch products after one small HtoD copy of the pointers. */
+
+#define RT_PTR_SLOTS 8
+static void *ptr_host[RT_PTR_SLOTS];
+static CUdeviceptr ptr_dev[RT_PTR_SLOTS];
+static CUevent ptr_done[RT_PTR_SLOTS];
+static long ptr_cap;
+static int ptr_slot;
+
+/* ponytail: the pointer arrays are rebuilt and copied on every call rather
+   than cached on (base pointers, strides); the ~3 KB copy at batch 32 is
+   small next to the calls it replaces.  The copy is async on the null stream,
+   so slots rotate and each carries an event that its next user waits on. */
+static int rt_ptr_slot(long n)
+{
+    int i;
+    if (ptr_cap < n) {
+        cuCtxSynchronize();
+        for (i = 0; i < RT_PTR_SLOTS; i++) {
+            if (ptr_host[i]) cuMemFreeHost(ptr_host[i]);
+            if (ptr_dev[i]) cuMemFree(ptr_dev[i]);
+            ptr_host[i] = 0;
+            ptr_dev[i] = 0;
+        }
+        ptr_cap = 0;
+        for (i = 0; i < RT_PTR_SLOTS; i++) {
+            if (cuMemAllocHost(&ptr_host[i], n * sizeof(void *)) != CUDA_SUCCESS)
+                return -1;
+            if (cuMemAlloc(&ptr_dev[i], n * sizeof(void *)) != CUDA_SUCCESS)
+                return -1;
+            if (!ptr_done[i] &&
+                cuEventCreate(&ptr_done[i], CU_EVENT_DISABLE_TIMING) !=
+                    CUDA_SUCCESS)
+                return -1;
+        }
+        ptr_cap = n;
+    }
+    i = ptr_slot;
+    ptr_slot = (ptr_slot + 1) % RT_PTR_SLOTS;
+    cuEventSynchronize(ptr_done[i]);
+    return i;
+}
+
+RPY_EXPORTED int rt_cuda_bmm2(long a, long b, long c, long nb2, long sa2,
+                              long sb2, long sc2, long batch, long rows,
+                              long inner, long cols, long ta, long tb,
+                              long dtype, long lda_, long ldb_, long ldc_,
+                              long sa, long sb, long sc, long tf32)
+{
+    double alpha = 1.0, beta = 0.0;
+    float alphaf = 1.0f, betaf = 0.0f;
+    unsigned short alphah = 0x3c00, betah = 0;
+    int ldb = ldb_ > 0 ? (int)ldb_ : (tb ? (int)inner : (int)cols);
+    int lda = lda_ > 0 ? (int)lda_ : (ta ? (int)rows : (int)inner);
+    int ldc = ldc_ > 0 ? (int)ldc_ : (int)cols;
+    long stra = sa > 0 ? sa : rows * inner;
+    long strb = sb > 0 ? sb : inner * cols;
+    long strc = sc > 0 ? sc : rows * cols;
+    long esz = dtype == 1 ? 4 : (dtype == 2 ? 2 : 8);
+    long total = nb2 * batch, g, t, i;
+    char **h;
+    char **da, **db, **dc;
+    int slot, ok;
+
+    if (nb2 <= 1)
+        return rt_cuda_bmm(a, b, c, batch, rows, inner, cols, ta, tb, dtype,
+                           lda_, ldb_, ldc_, sa, sb, sc, tf32);
+    if (!rt_cublas_init()) return 0;
+    if (dtype == 1 ? !p_cublasSgemmBatched
+                   : (dtype == 2 ? !p_cublasHgemmBatched
+                                 : !p_cublasDgemmBatched)) {
+        /* no pointer-array gemm in this cuBLAS, fall back to nb2 strided calls */
+        for (g = 0; g < nb2; g++)
+            if (!rt_cuda_bmm(a + g * sa2 * esz, b + g * sb2 * esz,
+                             c + g * sc2 * esz, batch, rows, inner, cols,
+                             ta, tb, dtype, lda_, ldb_, ldc_, sa, sb, sc,
+                             tf32))
+                return 0;
+        return 1;
+    }
+    slot = rt_ptr_slot(3 * total);
+    if (slot < 0) return 0;
+    h = (char **)ptr_host[slot];
+    i = 0;
+    for (g = 0; g < nb2; g++)
+        for (t = 0; t < batch; t++)
+            h[i++] = (char *)a + (g * sa2 + t * stra) * esz;
+    for (g = 0; g < nb2; g++)
+        for (t = 0; t < batch; t++)
+            h[i++] = (char *)b + (g * sb2 + t * strb) * esz;
+    for (g = 0; g < nb2; g++)
+        for (t = 0; t < batch; t++)
+            h[i++] = (char *)c + (g * sc2 + t * strc) * esz;
+    if (cuMemcpyHtoDAsync(ptr_dev[slot], h, 3 * total * sizeof(void *), 0)
+            != CUDA_SUCCESS)
+        return 0;
+    cuEventRecord(ptr_done[slot], 0);
+    da = (char **)ptr_dev[slot];
+    db = da + total;
+    dc = db + total;
+    /* cuBLAS is column-major, so our B is its first operand, as everywhere
+       else here. */
+    if (dtype == 1) {
+        rt_set_math(tf32);
+        ok = p_cublasSgemmBatched(
+            cublas_handle, tb ? 1 : 0, ta ? 1 : 0,
+            (int)cols, (int)rows, (int)inner, &alphaf,
+            (const float *const *)db, ldb, (const float *const *)da, lda,
+            &betaf, (float *const *)dc, ldc, (int)total) == 0;
+    } else if (dtype == 2) {
+        ok = p_cublasHgemmBatched(
+            cublas_handle, tb ? 1 : 0, ta ? 1 : 0,
+            (int)cols, (int)rows, (int)inner, &alphah,
+            (const unsigned short *const *)db, ldb,
+            (const unsigned short *const *)da, lda,
+            &betah, (unsigned short *const *)dc, ldc, (int)total) == 0;
+    } else {
+        ok = p_cublasDgemmBatched(
+            cublas_handle, tb ? 1 : 0, ta ? 1 : 0,
+            (int)cols, (int)rows, (int)inner, &alpha,
+            (const double *const *)db, ldb, (const double *const *)da, lda,
+            &beta, (double *const *)dc, ldc, (int)total) == 0;
+    }
+    return ok;
+}

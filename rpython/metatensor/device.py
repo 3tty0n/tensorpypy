@@ -1,0 +1,385 @@
+from rpython.rlib import jit, rgc
+from rpython.rlib.rarithmetic import intmask
+from rpython.rtyper.annlowlevel import cast_instance_to_base_ptr
+from rpython.rtyper.rclass import OBJECTPTR
+from rpython.rtyper.lltypesystem import lltype
+from rpython.rtyper.lltypesystem import rffi
+from rpython.translator.tool.cbuild import ExternalCompilationInfo
+import os
+from rpython.metatensor.core import (tracing, F64, HOSTARRAY, SHAPEARRAY, TENSOR, TENSORARRAY, _shape1, nbytes)
+
+class DeviceBuffer(object):
+    def __init__(self, dptr, n):
+        self.dptr = dptr
+        self.n = n
+
+    @rgc.must_be_light_finalizer
+    def __del__(self):
+        rt_cuda_free(self.dptr, self.n)
+
+def _no_lazy_force(t):
+    pass
+
+# rpython.metatensor.lazy rebinds this to its force() on import. A plain global
+# lets devops and ops reach the deferred layer without importing it. Not called
+# from host() or dev(): they run under the launcher oopspec, which may only
+# raise MemoryError, and forcing compiles a kernel.
+lazy_force = _no_lazy_force
+
+def attach_buffer(t, dptr, nb):
+    t.dptr = dptr
+    t.buf = cast_instance_to_base_ptr(DeviceBuffer(dptr, nb))
+
+def device_tensor(n, dptr, shape=lltype.nullptr(SHAPEARRAY), dtype=F64):
+    t = lltype.malloc(TENSOR)
+    t.size = n
+    t.shape = shape if shape else _shape1(n)
+    t.host = lltype.nullptr(HOSTARRAY)
+    t.extra = lltype.nullptr(TENSORARRAY)
+    t.dtype = dtype
+    t.lazy = lltype.nullptr(OBJECTPTR.TO)
+    attach_buffer(t, dptr, nbytes(n, dtype))
+    return t
+
+def host(t):
+    if not t.host:
+        t.host = lltype.malloc(HOSTARRAY, t.size)
+        download(t.dptr, t.host, t.dtype)
+    return t.host
+
+def dev(t):
+    if t.dptr == 0:
+        dptr = upload(t.host, t.dtype)
+        if dptr != 0:
+            attach_buffer(t, dptr, nbytes(t.size, t.dtype))
+    return t.dptr
+
+DOUBLEARRAY = rffi.CArray(rffi.DOUBLE)
+SIGNEDARRAY = rffi.CArray(lltype.Signed)
+_here = os.path.dirname(os.path.abspath(__file__))
+CUDA_HOME = os.environ.get('CUDA_HOME', '/usr/local/cuda')
+_cublas = os.environ.get('RTENSOR_CUBLAS')
+eci = ExternalCompilationInfo(
+    include_dirs=[os.path.join(CUDA_HOME, 'include')],
+    compile_extra=['-DRTENSOR_CUBLAS_PATH=%s' % _cublas] if _cublas else [],
+    separate_module_files=[os.path.join(_here, 'cuda.c')],
+    post_include_bits=["""
+RPY_EXTERN int rt_cuda_available(void);
+RPY_EXTERN long rt_cuda_load(const char *ptx, const char *name);
+RPY_EXTERN long rt_cuda_alloc(long nbytes, long zero);
+RPY_EXTERN long rt_cuda_alloc_soft(long nbytes, long zero);
+RPY_EXTERN void rt_cuda_warn_cpu(long fn);
+RPY_EXTERN void rt_cuda_warn_unfused(long fn);
+RPY_EXTERN void rt_cuda_warn_arity(long compiled, long launched);
+RPY_EXTERN long rt_cuda_upload(double *host, long n, long dtype);
+RPY_EXTERN int rt_cuda_download(long dptr, double *host, long n, long dtype);
+RPY_EXTERN int rt_dump(long dptr, double *host, long n, long dtype, long fd);
+RPY_EXTERN void rt_cuda_reset(void);
+RPY_EXTERN void rt_cuda_free(long dptr, long nbytes);
+RPY_EXTERN int rt_cuda_copy(long dst, long src, long nbytes);
+RPY_EXTERN void rt_cuda_set_budget(long bytes);
+RPY_EXTERN long rt_cuda_mem_total(void);
+RPY_EXTERN long rt_cuda_live_bytes(void);
+RPY_EXTERN long rt_cuda_launch_count(void);
+RPY_EXTERN void rt_cuda_note_unfused(long fn, long why);
+RPY_EXTERN void rt_cuda_debug_text(char *text);
+RPY_EXTERN long rt_cuda_unfused_count(void);
+RPY_EXTERN long rt_cuda_alloc_failed(void);
+RPY_EXTERN int rt_cuda_needs_gc(long nbytes);
+RPY_EXTERN int rt_cuda_has_free(long nbytes);
+RPY_EXTERN void rt_cuda_sync(void);
+RPY_EXTERN double rt_cuda_now(void);
+RPY_EXTERN int rt_cuda_launch(long fn, long *inputs, int ninputs, long n,
+                              long *outs, int nouts, int threads,
+                              long elems_per_block, int shared, int nextra,
+                              long cols);
+RPY_EXTERN int rt_cuda_launch_grid(long fn, long *args, int nargs, long gx,
+                                   long gy, int threads, int shared,
+                                   int nextra);
+RPY_EXTERN int rt_cuda_matmul(long a, long b, long c, long rows, long inner,
+                              long cols, long ta, long tb, long dtype,
+                              long tf32);
+RPY_EXTERN int rt_cuda_matmul_bias(long a, long b, long c, long bias,
+                                   long rows, long inner, long cols, long ta,
+                                   long tb, long tf32);
+RPY_EXTERN int rt_cuda_bmm(long a, long b, long c, long batch, long rows,
+                           long inner, long cols, long ta, long tb,
+                           long dtype, long lda, long ldb, long ldc,
+                           long sa, long sb, long sc, long tf32);
+RPY_EXTERN int rt_cuda_bmm2(long a, long b, long c, long nb2, long sa2,
+                            long sb2, long sc2, long batch, long rows,
+                            long inner, long cols, long ta, long tb,
+                            long dtype, long lda, long ldb, long ldc,
+                            long sa, long sb, long sc, long tf32);
+"""],
+    libraries=['cuda', 'dl'])
+rt_cuda_load = rffi.llexternal('rt_cuda_load', [rffi.CCHARP, rffi.CCHARP],
+                               lltype.Signed, compilation_info=eci,
+                                releasegil=False)
+rt_cuda_launch = rffi.llexternal(
+    'rt_cuda_launch',
+    [lltype.Signed, rffi.CArrayPtr(lltype.Signed), rffi.INT, lltype.Signed,
+     rffi.CArrayPtr(lltype.Signed), rffi.INT, rffi.INT, lltype.Signed,
+     rffi.INT, rffi.INT, lltype.Signed],
+    rffi.INT, compilation_info=eci,
+                                releasegil=False)
+rt_cuda_launch_grid = rffi.llexternal(
+    'rt_cuda_launch_grid',
+    [lltype.Signed, rffi.CArrayPtr(lltype.Signed), rffi.INT, lltype.Signed,
+     lltype.Signed, rffi.INT, rffi.INT, rffi.INT],
+    rffi.INT, compilation_info=eci, releasegil=False)
+rt_cuda_available = rffi.llexternal('rt_cuda_available', [], rffi.INT,
+                                    compilation_info=eci,
+                                releasegil=False)
+rt_cuda_warn_arity = rffi.llexternal('rt_cuda_warn_arity',
+                                     [lltype.Signed, lltype.Signed],
+                                     lltype.Void, compilation_info=eci,
+                                     releasegil=False)
+rt_cuda_warn_unfused = rffi.llexternal('rt_cuda_warn_unfused',
+                                       [lltype.Signed], lltype.Void,
+                                       compilation_info=eci, releasegil=False)
+rt_cuda_warn_cpu = rffi.llexternal('rt_cuda_warn_cpu', [lltype.Signed],
+                                   lltype.Void, compilation_info=eci,
+                                   releasegil=False)
+rt_cuda_alloc = rffi.llexternal('rt_cuda_alloc',
+                                [lltype.Signed, lltype.Signed],
+                                lltype.Signed, compilation_info=eci,
+                                releasegil=False)
+rt_cuda_alloc_soft = rffi.llexternal('rt_cuda_alloc_soft',
+                                     [lltype.Signed, lltype.Signed],
+                                     lltype.Signed, compilation_info=eci,
+                                     releasegil=False)
+rt_cuda_upload = rffi.llexternal('rt_cuda_upload',
+                                 [rffi.DOUBLEP, lltype.Signed,
+                                  lltype.Signed],
+                                 lltype.Signed, compilation_info=eci,
+                                releasegil=False)
+rt_cuda_download = rffi.llexternal('rt_cuda_download',
+                                   [lltype.Signed, rffi.DOUBLEP,
+                                    lltype.Signed, lltype.Signed],
+                                   rffi.INT, compilation_info=eci,
+                                releasegil=False)
+rt_cuda_reset = rffi.llexternal('rt_cuda_reset', [], lltype.Void,
+                                compilation_info=eci,
+                                releasegil=False)
+rt_cuda_now = rffi.llexternal('rt_cuda_now', [], rffi.DOUBLE,
+                              compilation_info=eci, releasegil=False)
+rt_cuda_sync = rffi.llexternal('rt_cuda_sync', [], lltype.Void,
+                               compilation_info=eci,
+                                releasegil=False)
+rt_cuda_matmul = rffi.llexternal(
+    'rt_cuda_matmul',
+    [lltype.Signed] * 10,
+    rffi.INT, compilation_info=eci,
+                                releasegil=False)
+rt_cuda_matmul_bias = rffi.llexternal(
+    'rt_cuda_matmul_bias',
+    [lltype.Signed] * 10,
+    rffi.INT, compilation_info=eci,
+                                releasegil=False)
+rt_cuda_bmm = rffi.llexternal(
+    'rt_cuda_bmm',
+    [lltype.Signed] * 17,
+    rffi.INT, compilation_info=eci,
+                                releasegil=False)
+rt_cuda_bmm2 = rffi.llexternal(
+    'rt_cuda_bmm2',
+    [lltype.Signed] * 21,
+    rffi.INT, compilation_info=eci,
+                                releasegil=False)
+
+def _env(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value
+
+def gpu_enabled():
+    if os.environ.get('RTENSOR_CPU') is not None:
+        return False
+    return rffi.cast(lltype.Signed, rt_cuda_available()) != 0
+
+def _upload_impl(hostarray, dtype=F64):
+    if not gpu_enabled():
+        return 0
+    n = len(hostarray)
+    buf = lltype.malloc(DOUBLEARRAY, n, flavor='raw')
+    for i in range(n):
+        buf[i] = hostarray[i]
+    dptr = rt_cuda_upload(buf, n, dtype)
+    lltype.free(buf, flavor='raw')
+    return dptr
+
+def upload(hostarray, dtype=F64):
+    t0 = prof_begin()
+    r = _upload_impl(hostarray, dtype)
+    prof_end(intmask(10), intmask(len(hostarray)), t0)
+    return r
+
+def _download_impl(dptr, hostarray, dtype=F64):
+    n = len(hostarray)
+    buf = lltype.malloc(DOUBLEARRAY, n, flavor='raw')
+    rt_cuda_download(dptr, buf, n, dtype)
+    for i in range(n):
+        hostarray[i] = buf[i]
+    lltype.free(buf, flavor='raw')
+
+rt_dump = rffi.llexternal('rt_dump', [lltype.Signed, rffi.DOUBLEP,
+                                      lltype.Signed, lltype.Signed,
+                                      lltype.Signed],
+                          rffi.INT, compilation_info=eci, releasegil=True)
+
+@jit.dont_look_inside
+def dump(t, fd):
+    """Write t as raw little-endian bytes into fd without a host copy; False on failure."""
+    if t.dptr != 0:
+        return rffi.cast(lltype.Signed, rt_dump(
+            t.dptr, lltype.nullptr(rffi.DOUBLEP.TO), t.size, t.dtype, fd)) != 0
+    chunk = 1 << 20
+    buf = lltype.malloc(DOUBLEARRAY, chunk, flavor='raw')
+    ok = True
+    i = 0
+    while ok and i < t.size:
+        m = min(chunk, t.size - i)
+        for j in range(m):
+            buf[j] = t.host[i + j]
+        ok = rffi.cast(lltype.Signed, rt_dump(0, buf, m, t.dtype, fd)) != 0
+        i += m
+    lltype.free(buf, flavor='raw')
+    return ok
+
+def download(dptr, hostarray, dtype=F64):
+    t0 = prof_begin()
+    _download_impl(dptr, hostarray, dtype)
+    prof_end(intmask(11), intmask(len(hostarray)), t0)
+
+
+
+rt_cuda_free = rffi.llexternal('rt_cuda_free', [lltype.Signed, lltype.Signed],
+                               lltype.Void, compilation_info=eci,
+                               releasegil=False)
+
+rt_cuda_copy = rffi.llexternal('rt_cuda_copy',
+                               [lltype.Signed, lltype.Signed, lltype.Signed],
+                               rffi.INT, compilation_info=eci,
+                               releasegil=False)
+
+rt_cuda_set_budget = rffi.llexternal('rt_cuda_set_budget', [lltype.Signed],
+                                     lltype.Void, compilation_info=eci,
+                                     releasegil=False)
+rt_cuda_live_bytes = rffi.llexternal('rt_cuda_live_bytes', [], lltype.Signed,
+                                     compilation_info=eci, releasegil=False)
+rt_cuda_mem_total = rffi.llexternal('rt_cuda_mem_total', [], lltype.Signed,
+                                    compilation_info=eci, releasegil=False)
+rt_cuda_needs_gc = rffi.llexternal('rt_cuda_needs_gc', [lltype.Signed], rffi.INT,
+                                   compilation_info=eci, releasegil=False)
+rt_cuda_has_free = rffi.llexternal('rt_cuda_has_free', [lltype.Signed], rffi.INT,
+                                   compilation_info=eci, releasegil=False)
+
+rt_cuda_launch_count = rffi.llexternal('rt_cuda_launch_count', [],
+                                       lltype.Signed, compilation_info=eci,
+                                       releasegil=False)
+rt_cuda_debug_text = rffi.llexternal('rt_cuda_debug_text', [rffi.CCHARP],
+                                     lltype.Void, compilation_info=eci,
+                                     releasegil=False)
+rt_cuda_note_unfused = rffi.llexternal('rt_cuda_note_unfused',
+                                       [lltype.Signed, lltype.Signed],
+                                       lltype.Void, compilation_info=eci,
+                                       releasegil=False)
+rt_cuda_unfused_count = rffi.llexternal('rt_cuda_unfused_count', [],
+                                        lltype.Signed, compilation_info=eci,
+                                        releasegil=False)
+
+rt_cuda_alloc_failed = rffi.llexternal('rt_cuda_alloc_failed', [],
+                                       lltype.Signed, compilation_info=eci,
+                                       releasegil=False)
+
+def launch_count():
+    return rt_cuda_launch_count()
+
+def mem_total():
+    """Bytes of device memory on GPU 0, or 0 without a usable GPU."""
+    return rt_cuda_mem_total()
+
+def live_bytes():
+    """Device bytes the allocator still holds (not capacity, see mem_total())."""
+    return rt_cuda_live_bytes()
+
+def alloc_failed():
+    """True if a device allocation has fallen back to the CPU."""
+    return rt_cuda_alloc_failed() != 0
+
+class Fallbacks(object):
+    n = 0
+fallbacks = Fallbacks()
+
+def note_unfused(fn, why):
+    """A fused kernel that ran unfused. Counted in C because the launcher is annotated late.
+
+    RTENSOR_DEBUG_UNFUSED=1 prints why (runtime.refusal)."""
+    if gpu_enabled():
+        rt_cuda_note_unfused(fn, why)
+
+def unfused_count():
+    return rt_cuda_unfused_count()
+
+def note_cpu_fallback():
+    """Count ops computed by a host loop although the GPU is on."""
+    if gpu_enabled():
+        fallbacks.n += 1
+
+class Profile(object):
+    def __init__(self):
+        self.enabled = False
+        self.times = {}
+        self.counts = {}
+profile = Profile()
+
+def prof_begin():
+    if not profile.enabled:
+        return 0.0
+    rt_cuda_sync()
+    return rt_cuda_now()
+
+PROF_NAMES = ['fused', 'per-node', 'matmul', 'bmm', 'im2col', 'col2chw',
+              'maxpool2', 'head_split', 'head_merge', 'assign', 'upload',
+              'download', 'strided', 'take', 'pool', 'attention']
+
+def prof_end(kind, extra, t0):
+    if not profile.enabled:
+        return
+    rt_cuda_sync()
+    dt = rt_cuda_now() - t0
+    key = kind * 1000000000 + extra
+    profile.times[key] = profile.times.get(key, 0.0) + dt
+    profile.counts[key] = profile.counts.get(key, 0) + 1
+
+def profile_report():
+    if not profile.enabled:
+        return
+    total = 0.0
+    for name in profile.times:
+        total += profile.times[name]
+    print 'profile total %f s' % total
+    for key in profile.times:
+        print '%f s %d calls %s %d' % (profile.times[key], profile.counts[key],
+                                           PROF_NAMES[key // 1000000000],
+                                           key % 1000000000)
+
+def collect_if_needed(nb):
+    if rffi.cast(lltype.Signed, rt_cuda_needs_gc(nb)) != 0:
+        rgc.collect(0)
+        if rffi.cast(lltype.Signed, rt_cuda_has_free(nb)) == 0:
+            tracing.pressure = True
+            rgc.collect()
+
+def device_alloc(nb, zero):
+    p = rt_cuda_alloc_soft(nb, zero)
+    if p == 0 and gpu_enabled():
+        tracing.pressure = True
+        rgc.collect()
+        p = rt_cuda_alloc(nb, zero)
+    return p
+
+def sync_device():
+    rt_cuda_sync()

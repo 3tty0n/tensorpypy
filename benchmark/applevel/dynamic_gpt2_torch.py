@@ -1,0 +1,93 @@
+"""Dynamic sequence-length sweep, PyTorch side.
+Same timed step and phases as dynamic_gpt2.py. compile_ms is -1 because torch.compile does not expose compile time apart from the first iteration.
+"""
+
+import json, os, sys, time
+
+import torch
+import torch._dynamo
+
+import gpt2_torch
+import torch_common
+
+ORDER = [32, 48, 64, 96, 128]
+NEW_ORDER = [160, 192, 224, 256, 288]
+WARMUP_LEN = 16
+PHASES = [('first', ORDER), ('revisit', ORDER), ('new', NEW_ORDER)]
+
+
+class Model(gpt2_torch.Model):
+    def __init__(self, cfg, flat, dtype, dev):
+        super().__init__(cfg, flat, dtype, dev)
+        self.wpe_flat = flat
+        self.wpe_off = cfg['index']['wpe'][0]
+        self.d = cfg['n_embd']
+        self.dev, self.dtype = dev, dtype
+
+    def pos_and_mask(self, t):
+        d = self.d
+        pos = self.wpe_flat[self.wpe_off:self.wpe_off + t * d].view(
+            t, d).to(self.dev, self.dtype)
+        m = torch.zeros(t, t, device=self.dev, dtype=self.dtype)
+        mask = m.masked_fill(
+            torch.triu(torch.ones(t, t, device=self.dev), 1).bool(), -1e9)
+        return pos, mask
+
+    def forward(self, idx, pos, mask):
+        return gpt2_torch.blocks_forward(self, self.wte[idx] + pos, mask)
+
+
+def graphs_of(mode):
+    if mode not in ('compile', 'compile-dynamic'):
+        return 0
+    return torch._dynamo.utils.counters['stats']['unique_graphs']
+
+
+def main():
+    mode = sys.argv[1]
+    outdir = sys.argv[2]
+    iters = int(sys.argv[3]) if len(sys.argv) > 3 else 200
+    dtype = getattr(torch, os.environ.get('RTENSOR_DTYPE', 'float32'))
+    dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+    cfg = json.load(open(os.path.join(outdir, 'index.json')))
+    tokens = cfg['tokens']
+    flat = torch_common.flat_weights(outdir)
+    model = Model(cfg, flat, dtype, dev).to(dev, dtype).eval()
+
+    fwd = model.forward
+    if mode in ('compile', 'compile-dynamic'):
+        torch._dynamo.reset()
+        fwd = torch.compile(model.forward, dynamic=mode == 'compile-dynamic')
+
+    def build(t):
+        ids = [tokens[i % len(tokens)] for i in range(t)]
+        idx = torch.tensor(ids, device=dev, dtype=torch.long)
+        pos, mask = model.pos_and_mask(t)
+        if dev == 'cuda':
+            torch.cuda.synchronize()
+        return idx, pos, mask
+
+    with torch.no_grad():
+        for _ in range(5):
+            fwd(*build(WARMUP_LEN)).sum().item()
+
+        per_phase = max(1, iters // len(PHASES))
+        print('pass\tlength\tstep_us\tbuild_us\tloops\tbridges\tkernels'
+              '\tlaunches\tgraphs\tnew_graphs\tcompile_ms')
+        for phase, lengths in PHASES:
+            for i in range(per_phase):
+                t = lengths[i % len(lengths)]
+                g0 = graphs_of(mode)
+                b0 = time.time()
+                idx, pos, mask = build(t)
+                b1 = time.time()
+                out = fwd(idx, pos, mask)
+                out.sum().item()
+                s1 = time.time()
+                g1 = graphs_of(mode)
+                print('%s\t%d\t%.1f\t%.1f\t0\t0\t0\t0\t%d\t%d\t-1' % (
+                    phase, t, (s1 - b1) * 1e6, (b1 - b0) * 1e6, g1, g1 - g0))
+
+
+if __name__ == '__main__':
+    main()

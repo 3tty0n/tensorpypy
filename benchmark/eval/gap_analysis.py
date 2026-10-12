@@ -1,0 +1,388 @@
+"""Where the JAX gap comes from: launches, fusion granularity, GPU utilisation.
+
+    benchmark/eval/bench.sh gap            # writes $OUT/gap.tsv
+    benchmark/eval/gap_analysis.py $OUT [MODEL...]
+
+Three systems run the same five small transformers, timed plainly and under nsys
+at two iteration counts; the difference of the traced runs is the per-forward
+cost with setup, warm-up and compilation cancelled. gpu_util = gpu_busy_us /
+steady_us. This file is also its own worker under pypy-c (Python 2), so it stays
+2-and-3 compatible.
+"""
+
+from __future__ import print_function
+
+import csv
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+APP = os.path.join(HERE, "..", "applevel")
+
+# model -> (pypy module, torch script, jax_models.py name, weights dir)
+MODELS = [
+    ("bert-base", "bert", "bert_torch.py", "bert", "bert-base"),
+    ("bert-mini", "bert", "bert_torch.py", "bert", "bert-mini"),
+    ("gpt2", "gpt2", "gpt2_torch.py", "gpt2", "gpt2"),
+    ("distilgpt2", "gpt2", "gpt2_torch.py", "gpt2", "distilgpt2"),
+    ("vit-base", "vit", "vit_torch.py", "vit", "vit-base"),
+]
+
+SYSTEMS = ["ours", "torch-compile", "jax"]
+
+# The two traced iteration counts. Their difference is the per-forward cost; the
+# low point must be large enough that a slow first steady iteration does not dominate.
+TRACE_LO, TRACE_HI, TRACE_WARM = 20, 120, 10
+
+NSYS = os.environ.get("NSYS", "/usr/local/cuda-13.1/bin/nsys")
+
+
+# --- worker (runs under pypy-c) ---------------------------------------------
+
+def worker_ours(module, weights, iters, warmup):
+    """The applevel model scripts print no launch count, so the timed loop is rebuilt around their build()."""
+    sys.path.insert(0, APP)
+    import time
+    import common
+    import _metatensor
+    mod = __import__(module)
+    cfg, buf = common.load(weights)
+    # build() returns the model followed by its inputs; how many inputs is the
+    # model's business (gpt2 also returns the position embedding).
+    built = mod.build(cfg, buf, os.environ.get("RTENSOR_DTYPE", "float32"))
+    model, inputs = built[0], built[1:]
+    out = model(*inputs)
+    out.sum().item()
+    for _ in range(warmup):
+        out = model(*inputs)
+    out.sum().item()
+    launches = _metatensor.launch_count()
+    t0 = time.time()
+    for _ in range(iters):
+        out = model(*inputs)
+    out.sum().item()
+    steady = (time.time() - t0) / iters * 1e6
+    print("gap steady_us=%.1f launches_per_iter=%.1f kernels=%d" % (
+        steady, float(_metatensor.launch_count() - launches) / iters,
+        _metatensor.kernel_count()))
+
+
+# --- running the three systems ----------------------------------------------
+
+def command(system, model, iters, warmup):
+    _, pymod, torchscript, jaxmodel, wdir = model
+    weights = os.path.join(os.environ.get("WEIGHTS", os.path.join(HERE, "weights")), wdir)
+    if system == "ours":
+        pypy = os.environ.get("PYPY", os.path.join(HERE, "build", "pypy-c"))
+        flags = os.environ.get("JIT_FLAGS", "").split()
+        return [pypy] + flags + [os.path.abspath(__file__), "--worker-ours",
+                                 pymod, weights, str(iters), str(warmup)]
+    if system == "torch-compile":
+        py = os.environ.get("TORCH_PYTHON") or os.environ.get("RTENSOR_PYTHON")
+        if not py:
+            return None
+        return [py, os.path.join(APP, torchscript), "compile", weights,
+                str(iters), str(warmup)]
+    if system == "jax":
+        py = os.environ.get("JAX_PYTHON")
+        if not py or not jaxmodel:
+            return None
+        return [py, os.path.join(APP, "jax_models.py"), jaxmodel, "jax",
+                weights, str(iters), str(warmup)]
+    return None
+
+
+def run(cmd):
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, _ = p.communicate()
+        return out.decode("utf-8", "replace") if p.returncode == 0 else None
+    except OSError:
+        return None
+
+
+def steady_of(text):
+    m = re.search(r"steady_us=([0-9.]+)", text or "")
+    return float(m.group(1)) if m else None
+
+
+# --- nsys -------------------------------------------------------------------
+
+def trace(cmd, tmp, tag):
+    """One nsys CUDA trace; returns {kernel name: (instances, total ns)}."""
+    rep = os.path.join(tmp, tag)
+    # Without --cuda-graph-trace=node, kernels XLA and Inductor launch from inside
+    # a CUDA graph are invisible and every steady-state count comes out zero.
+    if run([NSYS, "profile", "-t", "cuda", "--cuda-graph-trace=node",
+            "-o", rep, "--force-overwrite", "true"] + cmd) is None:
+        return None
+    counts = {}
+    for report in ("cuda_gpu_kern_sum", "cuda_gpu_mem_time_sum"):
+        text = run([NSYS, "stats", "--report", report, "--format", "csv",
+                    "--force-export", "true", rep + ".nsys-rep"])
+        if text is None:
+            continue
+        for row in csv.reader(text.splitlines()):
+            # Time(%), Total Time(ns), Instances/Count, ..., Name
+            if len(row) < 4 or not re.match(r"^[0-9.]+$", row[0].strip()):
+                continue
+            try:
+                counts[row[-1]] = (int(row[2]), int(row[1]))
+            except ValueError:
+                continue
+    return counts or None
+
+
+def category(name):
+    low = name.lower()
+    if "memcpy" in low or "memset" in low:
+        return "copy"
+    # cuBLAS finishes a split-K GEMM, and a fused epilogue, with a second kernel
+    # of its own. One cublasSgemm can show up as two launches, so these are kept
+    # apart from the GEMMs to avoid overcounting calls.
+    if "splitkreduce" in low or "epilogue::impl::globalkernel" in low:
+        return "splitk"
+    if ("cublas" in low or "cutlass" in low or "gemm" in low
+            or "gemv" in low or "dot_kernel" in low):
+        return "gemm"
+    if (low.startswith("rtensor_") or low.startswith("triton_")
+            or "fusion" in low or "loop_" in low or "wrapped_" in low):
+        return "gen"
+    return "other"
+
+
+# Inside the gemm bucket: the batched products an attention layer issues.
+# ATTN_NAME is a kernel that says it is attention (fused multi-head, explicit bmm).
+# BATCH_NAME only says the arguments are strided-batched, which cuBLAS also
+# stamps on plain gemv template parameters, so it is the last resort.
+ATTN_NAME = re.compile(r"fmha|flash|sdpa|\bmha|\bbmm|attention", re.I)
+BATCH_NAME = re.compile(r"batch", re.I)
+
+
+def n_layer(wdir):
+    """The model's transformer depth, from the exported checkpoint."""
+    import json
+    path = os.path.join(os.environ.get("WEIGHTS", os.path.join(HERE, "weights")),
+                        wdir, "index.json")
+    try:
+        f = open(path)
+        try:
+            return int(json.load(f).get("n_layer") or 0)
+        finally:
+            f.close()
+    except (IOError, OSError, ValueError):
+        return 0
+
+
+def bmm_count(per_kernel, layers):
+    """The batched attention products among a forward's GEMM launches.
+
+    cuBLAS reuses one kernel name for batched and unbatched products, so a name
+    pattern alone is a lower bound. A transformer issues two batched products
+    per layer (Q.K and the value product), so a GEMM kernel launched 2L times
+    per forward is that pair. First rule that fires:
+
+      1. a kernel whose name says attention (fused MHA, an explicit bmm);
+      2. GEMM kernels launched exactly 2L times per forward;
+      3. GEMM kernels whose name says strided-batched.
+
+    Rule 1 comes first because a fused attention kernel runs once per layer, and
+    rule 2 would then pick up an unrelated 2L linear.
+    """
+    gemms = [(count, name) for cat, count, _us, name in per_kernel
+             if cat == "gemm"]
+    named = sum(c for c, n in gemms if ATTN_NAME.search(n))
+    if named:
+        return named
+    if layers:
+        by_count = sum(c for c, _n in gemms if abs(c - 2 * layers) <= 0.05)
+        if by_count:
+            return by_count
+    return sum(c for c, n in gemms if BATCH_NAME.search(n))
+
+
+def per_forward(lo, hi):
+    """Per-forward launches, GPU time and kernel mix as the difference of the two
+    traced runs, which cancels upload, compilation and warm-up."""
+    n = float(TRACE_HI - TRACE_LO)
+    launches, ns, mix, kernels = 0.0, 0.0, {}, 0
+    per_kernel = []
+    for name, (count, total) in hi.items():
+        d = count - lo.get(name, (0, 0))[0]
+        if d <= 0:
+            continue
+        kernels += 1
+        launches += d / n
+        us = (total - lo.get(name, (0, 0))[1]) / n / 1e3
+        ns += (total - lo.get(name, (0, 0))[1]) / n
+        cat = category(name)
+        mix[cat] = mix.get(cat, 0.0) + d / n
+        per_kernel.append((cat, d / n, us, name))
+    per_kernel.sort(key=lambda r: -r[1])
+    return launches, ns / 1e3, kernels, mix, per_kernel
+
+
+# --- driver -----------------------------------------------------------------
+
+# The five class columns are the `notes` mix as numbers; they sum to
+# launches_per_iter and `measure` flags a mismatch.
+# `bmm` is a sub-count of `gemm`, not a sixth class.
+CLASSES = ["gemm", "splitk", "gen", "copy", "other"]
+# Per-kernel rows for gap_kernels.tsv, filled by measure().
+KERNEL_ROWS = []
+KERNEL_COLUMNS = ["model", "system", "class", "launches_per_iter", "us_per_iter",
+                  "kernel"]
+# Appended after `notes` so an older gap.tsv's header is a prefix of this one
+# and can be upgraded in place, as tsv_init does.
+COLUMNS = (["model", "system", "steady_us", "launches_per_iter", "kernels",
+            "gpu_busy_us", "gpu_util", "notes"] + CLASSES + ["bmm"])
+
+
+def measure(system, model, rounds, tmp):
+    name = model[0]
+    cmd = command(system, model, int(os.environ.get("ITERS", 200)),
+                  int(os.environ.get("WARMUP", 30)))
+    row = dict(model=name, system=system, steady_us="", launches_per_iter="",
+               kernels="", gpu_busy_us="", gpu_util="", notes="", bmm="")
+    for c in CLASSES:
+        row[c] = ""
+    if cmd is None:
+        row["notes"] = "not configured"
+        return row
+    # The GPU is shared, so rounds are interleaved by the caller and the median
+    # survives a neighbour's burst.
+    steadies = [s for s in rounds if s is not None]
+    if not steadies:
+        row["notes"] = "run failed"
+        return row
+    steadies.sort()
+    steady = steadies[len(steadies) // 2]
+    row["steady_us"] = "%.1f" % steady
+
+    lo = trace(command(system, model, TRACE_LO, TRACE_WARM), tmp,
+               "%s-%s-lo" % (name, system))
+    hi = trace(command(system, model, TRACE_HI, TRACE_WARM), tmp,
+               "%s-%s-hi" % (name, system))
+    if not lo or not hi:
+        row["notes"] = "nsys unavailable"
+        return row
+    launches, busy_us, kernels, mix, per_kernel = per_forward(lo, hi)
+    bmm = bmm_count(per_kernel, n_layer(model[4]))
+    # The evidence behind the class columns, one line per distinct kernel, and
+    # what bmm_count reads.
+    for cat, count, us, kname in per_kernel:
+        KERNEL_ROWS.append([name, system, cat, "%.2f" % count, "%.1f" % us,
+                            kname.replace("\t", " ")])
+    row["launches_per_iter"] = "%.1f" % launches
+    row["kernels"] = str(kernels)
+    row["gpu_busy_us"] = "%.1f" % busy_us
+    row["gpu_util"] = "%.3f" % (busy_us / steady) if steady else ""
+    row["notes"] = " ".join("%s=%.0f" % (k, mix[k]) for k in sorted(mix))
+    for c in CLASSES:
+        row[c] = "%.1f" % mix.get(c, 0.0)
+    row["bmm"] = "%.1f" % bmm
+    # The five classes partition the launches; a mismatch means a category()
+    # change dropped kernels.
+    if abs(sum(mix.values()) - launches) > 0.05:
+        row["notes"] += " CLASS-SUM-MISMATCH"
+    return row
+
+
+def selftest():
+    """The three bmm rules, on the shapes that actually occur in the traces."""
+    # A fused attention kernel runs once per layer; the 2L linear must not win.
+    distil = [("gemm", 12.0, 0, "ampere_sgemm_128x32_nn"),
+              ("gemm", 6.0, 0, "fmha_cutlassF_f32_aligned_64x64_rf_sm80"),
+              ("gen", 6.0, 0, "triton_poi_fused_x")]
+    assert bmm_count(distil, 6) == 6.0
+    # No attention name: the 2L GEMM is the Q.K / value pair.
+    vit = [("gemm", 60.0, 0, "ampere_sgemm_64x32_sliced1x4_tn"),
+           ("gemm", 24.0, 0, "ampere_sgemm_128x128_nn"),
+           ("gemm", 1.0, 0, "gemvx::kernel<cublasGemvTensorStridedBatched>")]
+    assert bmm_count(vit, 12) == 24.0
+    # Neither: fall back to the name, the old lower bound.
+    gpt2 = [("gemm", 8.0, 0, "ampere_sgemm_128x32_nn"),
+            ("gemm", 2.62, 0, "magma_sgemmEx_kernel<BatchedTensor>")]
+    assert abs(bmm_count(gpt2, 2) - 2.62) < 1e-9
+    # Nothing says batched and no kernel is 2L: honestly zero.
+    assert bmm_count([("gemm", 11.0, 0, "ampere_sgemm_32x32_sliced1x4_nn")], 2) == 0
+    print("ok")
+
+
+def main(argv):
+    if argv[1:2] == ["--selftest"]:
+        selftest()
+        return 0
+    if argv[1:2] == ["--worker-ours"]:
+        worker_ours(argv[2], argv[3], int(argv[4]), int(argv[5]))
+        return 0
+    out = argv[1] if len(argv) > 1 else os.environ.get("OUT")
+    if not out:
+        print("gap_analysis.py: give a result directory (or set OUT)",
+              file=sys.stderr)
+        return 1
+    wanted = argv[2:]
+    models = [m for m in MODELS if not wanted or m[0] in wanted]
+
+    nrounds = int(os.environ.get("ROUNDS", 3))
+    tmp = tempfile.mkdtemp(prefix="gap-")
+    rows = []
+    for model in models:
+        # Interleaved: every system sees the same slice of a shared GPU.
+        timings = dict((s, []) for s in SYSTEMS)
+        for _ in range(nrounds):
+            for s in SYSTEMS:
+                cmd = command(s, model, int(os.environ.get("ITERS", 200)),
+                              int(os.environ.get("WARMUP", 30)))
+                timings[s].append(steady_of(run(cmd)) if cmd else None)
+        for s in SYSTEMS:
+            row = measure(s, model, timings[s], tmp)
+            print("\t".join(row[c] for c in COLUMNS))
+            rows.append(row)
+
+    # Appended so one model can be re-measured without losing the rest; the
+    # figure keys on (model, system) and keeps the last row.
+    path = os.path.join(out, "gap.tsv")
+    header = "\t".join(COLUMNS)
+    fresh = not os.path.exists(path)
+    if not fresh:
+        # An older header is a prefix of this one, so updating the header line
+        # is enough (old rows have the new fields empty).
+        have = open(path).readline().rstrip("\n")
+        if have != header and header.startswith(have):
+            rest = open(path).readlines()[1:]
+            with open(path, "w") as f:
+                f.write(header + "\n")
+                f.writelines(rest)
+    with open(path, "a") as f:
+        if fresh:
+            f.write(header + "\n")
+        for row in rows:
+            f.write("\t".join(row[c] for c in COLUMNS) + "\n")
+    print("wrote " + path)
+
+    # gap.tsv is append-only and read last-row-wins; gap_kernels.tsv has no such
+    # key, so appending a re-measured pair would leave the files describing
+    # different traces. The pairs measured now replace their old rows instead.
+    kpath = os.path.join(out, "gap_kernels.tsv")
+    kept = []
+    measured = set((r[0], r[1]) for r in KERNEL_ROWS)
+    if os.path.exists(kpath):
+        for line in open(kpath).readlines()[1:]:
+            cells = line.rstrip("\n").split("\t")
+            if len(cells) >= 2 and (cells[0], cells[1]) not in measured:
+                kept.append(line)
+    with open(kpath, "w") as f:
+        f.write("\t".join(KERNEL_COLUMNS) + "\n")
+        f.writelines(kept)
+        for row in KERNEL_ROWS:
+            f.write("\t".join(row) + "\n")
+    print("wrote " + kpath)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

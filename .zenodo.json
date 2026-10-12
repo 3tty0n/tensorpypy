@@ -1,0 +1,27 @@
+{
+  "title": "TensorPyPy: MetaTensor and the MOTION leave transition",
+  "upload_type": "software",
+  "creators": [
+    {
+      "name": "Izawa, Yusuke",
+      "affiliation": "Tokyo Metropolitan University"
+    }
+  ],
+  "license": "MIT",
+  "description": "TensorPyPy is a fork of PyPy whose RPython meta-tracing JIT carries a tensor runtime, MetaTensor. Traced chains of tensor operations become fused GPU kernels. The repository also holds the MOTION leave transition, which is generated from an interpreter change rule, together with an audit of that rule and a hand-written adapter for comparison.",
+  "keywords": [
+    "PyPy",
+    "RPython",
+    "meta-tracing JIT",
+    "tensor compiler",
+    "kernel fusion",
+    "GPU"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "10.5281/zenodo.23298877",
+      "relation": "isSupplementTo",
+      "scheme": "doi"
+    }
+  ]
+}
