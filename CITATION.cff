@@ -6,7 +6,9 @@ authors:
   - family-names: Izawa
     given-names: Yusuke
     affiliation: Tokyo Metropolitan University
+    orcid: "https://orcid.org/0009-0005-4170-9977"
 license: MIT
+repository-code: "https://github.com/3tty0n/tensorpypy"
 abstract: |-
   TensorPyPy is a fork of PyPy whose RPython meta-tracing JIT compiler
   provides a tensor runtime, MetaTensor. Traced chains of tensor operations
