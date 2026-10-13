@@ -22,6 +22,9 @@ def get_list_of_files(shared):
     return files
 
 def test_same_file():
+    # TensorPyPy carries the vmprof sources of the PyPy it forked from, which
+    # no longer match vmprof upstream; this network check is for PyPy itself.
+    py.test.skip("vendored vmprof sources are pinned to the forked PyPy")
     shared = RVMPROF.join('src', 'shared')
     files = get_list_of_files(shared)
     assert files, 'cannot find any C file, probably the directory is wrong?'

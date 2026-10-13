@@ -260,9 +260,11 @@ def download(dptr, hostarray, dtype=F64):
 
 
 
+# Called from DeviceBuffer.__del__, a light finalizer: no wrapper, so the call
+# cannot collect.
 rt_cuda_free = rffi.llexternal('rt_cuda_free', [lltype.Signed, lltype.Signed],
                                lltype.Void, compilation_info=eci,
-                               releasegil=False)
+                               releasegil=False, _nowrapper=True)
 
 rt_cuda_copy = rffi.llexternal('rt_cuda_copy',
                                [lltype.Signed, lltype.Signed, lltype.Signed],
