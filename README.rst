@@ -2,6 +2,13 @@
 TensorPyPy / MetaTensor (public snapshot)
 ==========================================
 
+.. |doi| image:: https://zenodo.org/badge/DOI/10.5281/zenodo.23298877.svg
+  :target: https://doi.org/10.5281/zenodo.23298877
+
++----------+---------+
+| preprint | |doi|   |
++----------+---------+
+
 TensorPyPy is a fork of PyPy. Its RPython meta-tracing JIT carries a tensor
 runtime, MetaTensor. The code is in ``rpython/metatensor/``,
 ``pypy/module/_metatensor/`` and ``lib_pypy/tensorpypy/``.
@@ -17,13 +24,6 @@ License
 Upstream PyPy files are under ``LICENSE``. The TensorPyPy and MetaTensor
 additions, including everything under ``benchmark/``, are under the MIT
 license in ``LICENSE-tensorpypy``, copyright Yusuke Izawa.
-
-How to cite
------------
-
-Each release is archived on Zenodo. The DOI badge will be added here after
-the first release. Citation metadata is in ``CITATION.cff``. The MetaTensor
-preprint is https://doi.org/10.5281/zenodo.23298877.
 
 The PyPy README follows.
 
