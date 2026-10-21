@@ -11,6 +11,7 @@ TensorPyPy / MetaTensor (public snapshot)
 
 TensorPyPy is a fork of PyPy. Its RPython meta-tracing JIT compiler carries a 
 tensor runtime, MetaTensor. The code is in:
+
 - ``rpython/metatensor/``,
 - ``pypy/module/_metatensor/`` and 
 - ``lib_pypy/tensorpypy/``.
