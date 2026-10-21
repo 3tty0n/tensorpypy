@@ -9,14 +9,15 @@ TensorPyPy / MetaTensor (public snapshot)
 | preprint | |doi|   |
 +----------+---------+
 
-TensorPyPy is a fork of PyPy. Its RPython meta-tracing JIT carries a tensor
-runtime, MetaTensor. The code is in ``rpython/metatensor/``,
-``pypy/module/_metatensor/`` and ``lib_pypy/tensorpypy/``.
-
-This repository is a snapshot of the development repository. It has no
-history, no benchmark results, no raw data and no internal notes.
+TensorPyPy is a fork of PyPy. Its RPython meta-tracing JIT compiler carries a 
+tensor runtime, MetaTensor. The code is in:
+- ``rpython/metatensor/``,
+- ``pypy/module/_metatensor/`` and 
+- ``lib_pypy/tensorpypy/``.
 
 Benchmarks and experiments are described in ``benchmark/README.md``.
+
+Note that this repository is a snapshot of the development repository. 
 
 License
 -------
